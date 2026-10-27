@@ -5,6 +5,8 @@ pub const SOCKET_PATH: &str = "/run/rog-control/control.sock";
 /// Percorso del file in cui il demone salva l'ultimo effetto Aura applicato.
 /// L'effetto RGB non è leggibile dal controller, quindi va ricordato lato software.
 pub const AURA_STATE_PATH: &str = "/var/lib/rog-control/aura.json";
+/// Configurazione del demone: modalità operativa, modalità GPU, profili manuali.
+pub const CONFIG_PATH: &str = "/var/lib/rog-control/config.json";
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,9 +20,7 @@ pub struct Request {
 pub enum Command {
     /// Legge tutto lo stato hardware.
     State,
-    SetKbdBrightness {
-        value: u8,
-    },
+    SetKbdBrightness { value: u8 },
     /// Applica un effetto Aura globale (la tastiera non supporta le zone).
     SetAura {
         mode: u8,
@@ -29,35 +29,34 @@ pub enum Command {
         speed: u8,
         direction: u8,
     },
-    SetDisplayBrightness {
-        value: u32,
+    SetDisplayBrightness { value: u32 },
+    SetFanCurve { fan: u8, points: Vec<CurvePoint>, enabled: bool },
+    SetProfile { profile: String },
+    /// Modalità operativa stile Armoury Crate: windows, silent, performance, turbo, manual.
+    SetOperatingMode { mode: String },
+    /// Modalità GPU: ultimate, standard, eco, optimized.
+    SetGpuMode { mode: String },
+    /// Limiti CPU in watt (5 = auto firmware).
+    SetPpt { spl: u8, sppt: u8 },
+    /// Limiti GPU NVIDIA.
+    SetNvLimits { temp_target: u8, dynamic_boost: u8 },
+    /// Salva il profilo manuale per la sorgente indicata ("ac" o "battery").
+    SaveManualProfile {
+        source: String,
+        cpu: Vec<CurvePoint>,
+        gpu: Vec<CurvePoint>,
+        nv_temp_target: u8,
+        nv_dynamic_boost: u8,
+        spl: u8,
+        sppt: u8,
     },
-    SetFanCurve {
-        fan: u8,
-        points: Vec<CurvePoint>,
-        enabled: bool,
-    },
-    SetProfile {
-        profile: String,
-    },
-    SetChargeLimit {
-        value: u8,
-    },
-    SetPanelOverdrive {
-        value: bool,
-    },
-    SetBootSound {
-        value: bool,
-    },
-    SetDgpuDisabled {
-        value: bool,
-    },
-    SetGpuMux {
-        value: u8,
-    },
-    SetCpuBoost {
-        value: bool,
-    },
+    SetManualEnabled { enabled: bool },
+    SetChargeLimit { value: u8 },
+    SetPanelOverdrive { value: bool },
+    SetBootSound { value: bool },
+    SetDgpuDisabled { value: bool },
+    SetGpuMux { value: u8 },
+    SetCpuBoost { value: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,12 +80,18 @@ impl Response {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     pub system: SystemInfo,
+    pub cpu: CpuState,
+    pub memory: MemoryState,
+    pub storage: StorageState,
     pub keyboard: KeyboardState,
     pub aura: AuraState,
     pub fans: Vec<FanState>,
     pub profile: ProfileState,
     pub battery: BatteryState,
     pub gpu: GpuState,
+    pub ppt: PptState,
+    pub manual: ManualState,
+    pub operating_mode: String,
     pub backlight: Option<BacklightState>,
     pub temps: Vec<TempReading>,
     pub nvidia: Option<NvidiaInfo>,
@@ -105,6 +110,26 @@ pub struct SystemInfo {
     pub cpu_boost: Option<bool>,
     pub daemon_version: String,
     pub socket: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CpuState {
+    pub freq_mhz: f32,
+    pub usage_pct: f32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryState {
+    pub total_mb: u64,
+    pub used_mb: u64,
+    pub available_mb: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StorageState {
+    pub total_gb: f32,
+    pub used_gb: f32,
+    pub free_gb: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -162,10 +187,12 @@ pub struct BatteryState {
     pub capacity: u8,
     pub status: String,
     pub power_now_w: f32,
+    pub ac_online: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GpuState {
+    pub mode: String,
     pub dgpu_disabled: bool,
     pub mux_mode: u8,
     pub panel_overdrive: bool,
@@ -174,6 +201,55 @@ pub struct GpuState {
     pub pending_reboot: bool,
     pub dgpu_available: bool,
     pub mux_available: bool,
+    pub nv_temp_target: u8,
+    pub nv_dynamic_boost: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PptState {
+    pub spl: u8,
+    pub sppt: u8,
+    pub auto: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ManualState {
+    pub enabled: bool,
+    pub source: String,
+    pub ac: ManualProfile,
+    pub battery: ManualProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualProfile {
+    pub cpu: Vec<CurvePoint>,
+    pub gpu: Vec<CurvePoint>,
+    pub nv_temp_target: u8,
+    pub nv_dynamic_boost: u8,
+    pub spl: u8,
+    pub sppt: u8,
+}
+
+impl Default for ManualProfile {
+    fn default() -> Self {
+        Self {
+            cpu: default_curve(1),
+            gpu: default_curve(2),
+            nv_temp_target: 75,
+            nv_dynamic_boost: 5,
+            spl: 5,
+            sppt: 5,
+        }
+    }
+}
+
+fn default_curve(fan: u8) -> Vec<CurvePoint> {
+    let base: [(u8, u8); 8] = if fan == 1 {
+        [(40, 0), (50, 30), (60, 50), (70, 80), (78, 120), (84, 160), (90, 200), (96, 255)]
+    } else {
+        [(40, 0), (50, 40), (60, 60), (70, 90), (78, 130), (84, 170), (90, 210), (96, 255)]
+    };
+    base.iter().map(|&(temp, pwm)| CurvePoint { temp, pwm }).collect()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -195,4 +271,9 @@ pub struct NvidiaInfo {
     pub util_pct: f32,
     pub power_w: f32,
     pub clock_mhz: f32,
+    pub mem_clock_mhz: f32,
+    pub mem_used_mb: f32,
+    pub mem_total_mb: f32,
+    pub power_limit_w: f32,
+    pub max_power_limit_w: f32,
 }

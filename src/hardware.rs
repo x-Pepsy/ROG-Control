@@ -2,7 +2,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::protocol::*;
 
@@ -10,9 +12,40 @@ const KBD_LED: &str = "/sys/class/leds/asus::kbd_backlight";
 const FW_ATTRS: &str = "/sys/class/firmware-attributes/asus-armoury/attributes";
 const WMI: &str = "/sys/devices/platform/asus-nb-wmi";
 const BAT: &str = "/sys/class/power_supply/BAT0";
+const AC: &str = "/sys/class/power_supply/ADP0/online";
 const CPU_BOOST: &str = "/sys/devices/system/cpu/cpufreq/boost";
 
 pub type HwResult<T> = Result<T, String>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    #[serde(default)]
+    pub operating_mode: String,
+    #[serde(default)]
+    pub gpu_mode: String,
+    #[serde(default)]
+    pub manual_enabled: bool,
+    #[serde(default)]
+    pub manual_ac: ManualProfile,
+    #[serde(default)]
+    pub manual_battery: ManualProfile,
+    /// Limite di ricarica persistente (0 = non impostato).
+    #[serde(default)]
+    pub charge_limit: u8,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            operating_mode: String::new(),
+            gpu_mode: String::new(),
+            manual_enabled: false,
+            manual_ac: ManualProfile::default(),
+            manual_battery: ManualProfile::default(),
+            charge_limit: 0,
+        }
+    }
+}
 
 fn err(path: &str, e: std::io::Error) -> String {
     format!("{path}: {e}")
@@ -66,6 +99,14 @@ fn fw_attr_available(name: &str) -> bool {
 
 fn set_fw_attr(name: &str, value: &str) -> HwResult<()> {
     write_str(format!("{FW_ATTRS}/{name}/current_value"), value)
+}
+
+fn ac_online() -> bool {
+    read_opt(AC).as_deref() == Some("1")
+}
+
+fn source_name() -> &'static str {
+    if ac_online() { "ac" } else { "battery" }
 }
 
 /// Cerca l'hidraw del controller RGB della tastiera (0b05:19b6).
@@ -157,6 +198,59 @@ fn load_aura() -> AuraState {
         .unwrap_or_default()
 }
 
+fn save_config(cfg: &DaemonConfig) -> HwResult<()> {
+    if let Some(dir) = Path::new(CONFIG_PATH).parent() {
+        fs::create_dir_all(dir).map_err(|e| err(&dir.display().to_string(), e))?;
+    }
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let tmp = format!("{CONFIG_PATH}.tmp");
+    fs::write(&tmp, json).map_err(|e| err(&tmp, e))?;
+    fs::rename(&tmp, CONFIG_PATH).map_err(|e| err(CONFIG_PATH, e))
+}
+
+fn mode_from_profile(profile: &str) -> String {
+    match profile.trim().to_lowercase().as_str() {
+        "quiet" => "silent",
+        "performance" => "turbo",
+        _ => "windows",
+    }
+    .to_string()
+}
+
+fn effective_mode(cfg: &DaemonConfig, profile: &ProfileState) -> String {
+    if cfg.manual_enabled {
+        return "manual".to_string();
+    }
+    match profile.current.trim().to_lowercase().as_str() {
+        "quiet" => "silent".to_string(),
+        "performance" => "turbo".to_string(),
+        _ => {
+            if cfg.operating_mode == "performance" {
+                "performance".to_string()
+            } else {
+                "windows".to_string()
+            }
+        }
+    }
+}
+
+fn load_config() -> DaemonConfig {
+    let mut cfg: DaemonConfig = fs::read_to_string(CONFIG_PATH)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if cfg.operating_mode.is_empty() {
+        cfg.operating_mode = mode_from_profile(&profile_state().current);
+    }
+    if cfg.manual_ac.cpu.len() != 8 {
+        cfg.manual_ac = ManualProfile::default();
+    }
+    if cfg.manual_battery.cpu.len() != 8 {
+        cfg.manual_battery = ManualProfile::default();
+    }
+    cfg
+}
+
 fn os_name() -> String {
     fs::read_to_string("/etc/os-release")
         .ok()
@@ -194,6 +288,95 @@ fn system_info(cpu_boost: Option<bool>) -> SystemInfo {
     }
 }
 
+fn cpu_times() -> Option<(u64, u64)> {
+    let text = fs::read_to_string("/proc/stat").ok()?;
+    let line = text.lines().next()?;
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    let total: u64 = fields.iter().sum();
+    let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
+    Some((total, idle))
+}
+
+fn cpu_freq_mhz() -> f32 {
+    let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else { return 0.0 };
+    let mut sum = 0f32;
+    let mut count = 0f32;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(num) = name.strip_prefix("cpu") else { continue };
+        if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Some(khz) = read_num::<u64>(entry.path().join("cpufreq/scaling_cur_freq")) {
+            sum += khz as f32 / 1000.0;
+            count += 1.0;
+        }
+    }
+    if count > 0.0 {
+        return sum / count;
+    }
+    // fallback: cpu MHz da /proc/cpuinfo
+    if let Ok(text) = fs::read_to_string("/proc/cpuinfo") {
+        let mut sum = 0f32;
+        let mut n = 0f32;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("cpu MHz") {
+                if let Some(v) = rest.split(':').nth(1).and_then(|v| v.trim().parse::<f32>().ok()) {
+                    sum += v;
+                    n += 1.0;
+                }
+            }
+        }
+        if n > 0.0 {
+            return sum / n;
+        }
+    }
+    0.0
+}
+
+fn memory_state() -> MemoryState {
+    let Ok(text) = fs::read_to_string("/proc/meminfo") else { return MemoryState::default() };
+    let mut total_kb = 0u64;
+    let mut avail_kb = 0u64;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            avail_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        }
+    }
+    MemoryState {
+        total_mb: total_kb / 1024,
+        used_mb: total_kb.saturating_sub(avail_kb) / 1024,
+        available_mb: avail_kb / 1024,
+    }
+}
+
+fn storage_state() -> StorageState {
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(b"/\0".as_ptr() as *const libc::c_char, &mut stat) != 0 {
+            return StorageState::default();
+        }
+        let frsize = stat.f_frsize as u64;
+        let total = stat.f_blocks as u64 * frsize;
+        let free = stat.f_bavail as u64 * frsize;
+        let used = total.saturating_sub(free);
+        StorageState {
+            total_gb: total as f32 / 1e9,
+            used_gb: used as f32 / 1e9,
+            free_gb: free as f32 / 1e9,
+        }
+    }
+}
+
 fn keyboard_state(has_rgb: bool) -> KeyboardState {
     KeyboardState {
         brightness: read_num(format!("{KBD_LED}/brightness")).unwrap_or(0),
@@ -209,16 +392,15 @@ fn fan_states() -> Vec<FanState> {
 
     for fan in 1u8..=2 {
         let rpm = read_num::<u32>(base.join(format!("fan{fan}_input"))).unwrap_or(0);
-        let label = read_opt(base.join(format!("fan{fan}_label")))
-            .unwrap_or_else(|| if fan == 1 { "CPU".into() } else { "GPU".into() });
-        let label = if label.to_lowercase().contains("cpu") {
+        let raw_label = read_opt(base.join(format!("fan{fan}_label"))).unwrap_or_default();
+        let label = if raw_label.to_lowercase().contains("cpu") {
             "CPU".to_string()
-        } else if label.to_lowercase().contains("gpu") {
+        } else if raw_label.to_lowercase().contains("gpu") {
             "GPU".to_string()
-        } else if label.is_empty() {
-            if fan == 1 { "CPU".to_string() } else { "GPU".to_string() }
+        } else if fan == 1 {
+            "CPU".to_string()
         } else {
-            label
+            "GPU".to_string()
         };
 
         let mut custom = false;
@@ -243,7 +425,6 @@ fn fan_states() -> Vec<FanState> {
 }
 
 fn defaults_for(fan: u8) -> Vec<CurvePoint> {
-    // Curva prudente di riferimento, solo per il primo avvio/letture fallite.
     let base: [(u8, u8); 8] = if fan == 1 {
         [(40, 0), (50, 30), (60, 50), (70, 80), (78, 120), (84, 160), (90, 200), (96, 255)]
     } else {
@@ -275,10 +456,17 @@ fn battery_state() -> BatteryState {
         capacity: read_num(format!("{BAT}/capacity")).unwrap_or(0),
         status: read_opt(format!("{BAT}/status")).unwrap_or_default(),
         power_now_w,
+        ac_online: ac_online(),
     }
 }
 
-fn gpu_state() -> GpuState {
+fn ppt_state() -> PptState {
+    let spl = read_num::<u8>(format!("{WMI}/ppt_pl1_spl")).unwrap_or(5);
+    let sppt = read_num::<u8>(format!("{WMI}/ppt_pl2_sppt")).unwrap_or(5);
+    PptState { spl, sppt, auto: spl == 5 && sppt == 5 }
+}
+
+fn gpu_state(cfg: &DaemonConfig) -> GpuState {
     let panel_overdrive = fw_attr("panel_overdrive")
         .or_else(|| read_opt(format!("{WMI}/panel_od")))
         .map(|v| v == "1")
@@ -287,10 +475,26 @@ fn gpu_state() -> GpuState {
         .or_else(|| read_opt(format!("{WMI}/boot_sound")))
         .map(|v| v == "1")
         .unwrap_or(false);
+    let dgpu_disabled = fw_attr("dgpu_disable").as_deref() == Some("1");
+    let mux_mode = fw_attr("gpu_mux_mode").and_then(|v| v.parse().ok()).unwrap_or(0);
+
+    let derived = if mux_mode == 1 {
+        "ultimate"
+    } else if dgpu_disabled {
+        "eco"
+    } else {
+        "standard"
+    };
+    let mode = if cfg.gpu_mode == "optimized" && !dgpu_disabled && mux_mode == 0 {
+        "optimized".to_string()
+    } else {
+        derived.to_string()
+    };
 
     GpuState {
-        dgpu_disabled: fw_attr("dgpu_disable").as_deref() == Some("1"),
-        mux_mode: fw_attr("gpu_mux_mode").and_then(|v| v.parse().ok()).unwrap_or(0),
+        mode,
+        dgpu_disabled,
+        mux_mode,
         panel_overdrive,
         boot_sound,
         charge_mode: fw_attr("charge_mode").and_then(|v| v.parse().ok()).unwrap_or(1),
@@ -299,22 +503,27 @@ fn gpu_state() -> GpuState {
             .unwrap_or(false),
         dgpu_available: fw_attr_available("dgpu_disable"),
         mux_available: fw_attr_available("gpu_mux_mode"),
+        nv_temp_target: read_num(format!("{WMI}/nv_temp_target")).unwrap_or(75),
+        nv_dynamic_boost: read_num(format!("{WMI}/nv_dynamic_boost")).unwrap_or(5),
     }
 }
 
-fn backlight_state() -> Option<BacklightState> {
+fn backlight_path() -> Option<PathBuf> {
     let mut best: Option<PathBuf> = None;
     for entry in fs::read_dir("/sys/class/backlight").ok()?.flatten() {
         let p = entry.path();
         if entry.file_name().to_string_lossy().contains("nvidia") {
-            best = Some(p);
-            break;
+            return Some(p);
         }
         if best.is_none() {
             best = Some(p);
         }
     }
-    let p = best?;
+    best
+}
+
+fn backlight_state() -> Option<BacklightState> {
+    let p = backlight_path()?;
     Some(BacklightState {
         brightness: read_num(p.join("brightness")).unwrap_or(0),
         max_brightness: read_num(p.join("max_brightness")).unwrap_or(100),
@@ -388,7 +597,7 @@ fn temps() -> Vec<TempReading> {
 fn nvidia_info() -> Option<NvidiaInfo> {
     let output = Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,temperature.gpu,utilization.gpu,power.draw,clocks.sm",
+            "--query-gpu=name,temperature.gpu,utilization.gpu,power.draw,clocks.sm,clocks.mem,memory.used,memory.total,power.limit,power.max_limit",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -399,7 +608,7 @@ fn nvidia_info() -> Option<NvidiaInfo> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let first = stdout.lines().next()?.trim();
     let parts: Vec<&str> = first.split(',').map(str::trim).collect();
-    if parts.len() < 5 {
+    if parts.len() < 10 {
         return None;
     }
     let num = |s: &str| s.replace("N/A", "0").parse::<f32>().unwrap_or(0.0);
@@ -409,6 +618,11 @@ fn nvidia_info() -> Option<NvidiaInfo> {
         util_pct: num(parts[2]),
         power_w: num(parts[3]),
         clock_mhz: num(parts[4]),
+        mem_clock_mhz: num(parts[5]),
+        mem_used_mb: num(parts[6]),
+        mem_total_mb: num(parts[7]),
+        power_limit_w: num(parts[8]),
+        max_power_limit_w: num(parts[9]),
     })
 }
 
@@ -416,19 +630,78 @@ fn cpu_boost() -> Option<bool> {
     read_num::<u8>(CPU_BOOST).map(|v| v == 1)
 }
 
+fn validate_curve(points: &[CurvePoint]) -> Result<(), String> {
+    if points.len() != 8 {
+        return Err("la curva deve avere esattamente 8 punti".to_string());
+    }
+    let mut prev_temp = 0u8;
+    let mut prev_pwm = 0u8;
+    for (i, p) in points.iter().enumerate() {
+        if p.temp > 120 {
+            return Err(format!("punto {}: temperatura troppo alta ({}°C)", i + 1, p.temp));
+        }
+        if p.temp < prev_temp {
+            return Err(format!("punto {}: le temperature devono essere crescenti", i + 1));
+        }
+        if p.pwm < prev_pwm {
+            return Err(format!("punto {}: i valori PWM devono essere crescenti", i + 1));
+        }
+        prev_temp = p.temp;
+        prev_pwm = p.pwm;
+    }
+    Ok(())
+}
+
 pub struct Hardware {
     pub aura: AuraState,
+    pub config: DaemonConfig,
     hidraw: Option<PathBuf>,
     aura_saved: bool,
+    cpu_prev: Option<(u64, u64)>,
+    last_state_at: Instant,
 }
 
 impl Hardware {
     pub fn new() -> Self {
         let aura_saved = Path::new(AURA_STATE_PATH).exists();
-        Self { aura: load_aura(), hidraw: find_hidraw(), aura_saved }
+        let mut config = load_config();
+        // Adotta il limite di ricarica già presente nell'EC alla prima esecuzione,
+        // così l'impostazione esistente diventa persistente.
+        if !(20..=100).contains(&config.charge_limit) {
+            if let Some(v) = read_num::<u8>(format!("{BAT}/charge_control_end_threshold")) {
+                if (20..=100).contains(&v) {
+                    config.charge_limit = v;
+                    let _ = save_config(&config);
+                }
+            }
+        }
+        let hw = Self {
+            aura: load_aura(),
+            config,
+            hidraw: find_hidraw(),
+            aura_saved,
+            cpu_prev: cpu_times(),
+            last_state_at: Instant::now(),
+        };
+        if (20..=100).contains(&hw.config.charge_limit) {
+            if let Err(e) = write_str(
+                format!("{BAT}/charge_control_end_threshold"),
+                &hw.config.charge_limit.to_string(),
+            ) {
+                eprintln!("impossibile ripristinare il limite di ricarica: {e}");
+            }
+        }
+        hw
     }
 
-    /// Ripristina l'ultimo effetto Aura salvato (usato all'avvio del demone).
+    pub fn reload_config(&mut self) {
+        self.config = load_config();
+    }
+
+    pub fn has_saved_aura(&self) -> bool {
+        self.aura_saved
+    }
+
     pub fn reapply_saved_aura(&self) -> HwResult<()> {
         if !self.aura_saved {
             return Ok(());
@@ -436,24 +709,51 @@ impl Hardware {
         apply_aura(&self.aura)
     }
 
-    pub fn has_saved_aura(&self) -> bool {
-        self.aura_saved
-    }
-
     pub fn has_rgb(&self) -> bool {
         self.hidraw.is_some() || find_hidraw().is_some()
     }
 
-    pub fn state(&self) -> State {
-        let has_rgb = self.has_rgb();
+    pub fn state(&mut self) -> State {
+        let profile = profile_state();
+        let battery = battery_state();
+        let gpu = gpu_state(&self.config);
+        let operating_mode = effective_mode(&self.config, &profile);
+
+        let now = cpu_times();
+        let usage_pct = match (self.cpu_prev, now) {
+            (Some((pt, pi)), Some((ct, ci))) if ct > pt => {
+                let dt = (ct - pt) as f32;
+                let di = ct.saturating_sub(ci).saturating_sub(pt.saturating_sub(pi));
+                // idle delta = (ct - ci) - (pt - pi); usage = (dt - idle_delta) / dt
+                let idle_delta = di as f32;
+                ((dt - idle_delta) / dt * 100.0).clamp(0.0, 100.0)
+            }
+            _ => 0.0,
+        };
+        self.cpu_prev = now;
+        self.last_state_at = Instant::now();
+
+        let cpu = CpuState { freq_mhz: cpu_freq_mhz(), usage_pct };
+
         State {
             system: system_info(cpu_boost()),
-            keyboard: keyboard_state(has_rgb),
+            cpu,
+            memory: memory_state(),
+            storage: storage_state(),
+            keyboard: keyboard_state(self.has_rgb()),
             aura: self.aura.clone(),
             fans: fan_states(),
-            profile: profile_state(),
-            battery: battery_state(),
-            gpu: gpu_state(),
+            profile,
+            battery,
+            gpu,
+            ppt: ppt_state(),
+            manual: ManualState {
+                enabled: self.config.manual_enabled,
+                source: source_name().to_string(),
+                ac: self.config.manual_ac.clone(),
+                battery: self.config.manual_battery.clone(),
+            },
+            operating_mode,
             backlight: backlight_state(),
             temps: temps(),
             nvidia: nvidia_info(),
@@ -462,8 +762,7 @@ impl Hardware {
 
     pub fn set_kbd_brightness(&self, value: u8) -> HwResult<()> {
         let max: u8 = read_num(format!("{KBD_LED}/max_brightness")).unwrap_or(3);
-        let v = value.min(max);
-        write_str(format!("{KBD_LED}/brightness"), &v.to_string())
+        write_str(format!("{KBD_LED}/brightness"), &value.min(max).to_string())
     }
 
     pub fn set_aura(&mut self, mode: u8, colour1: [u8; 3], colour2: [u8; 3], speed: u8, direction: u8) -> HwResult<()> {
@@ -485,23 +784,8 @@ impl Hardware {
 
     pub fn set_display_brightness(&self, value: u32) -> HwResult<()> {
         let bl = backlight_state().ok_or_else(|| "backlight non trovato".to_string())?;
-        let v = value.min(bl.max_brightness);
-        // Rilegge il percorso per non dipendere dalla struct
-        let mut best: Option<PathBuf> = None;
-        for entry in fs::read_dir("/sys/class/backlight")
-            .map_err(|e| err("/sys/class/backlight", e))?
-            .flatten()
-        {
-            if entry.file_name().to_string_lossy().contains("nvidia") {
-                best = Some(entry.path());
-                break;
-            }
-            if best.is_none() {
-                best = Some(entry.path());
-            }
-        }
-        let p = best.ok_or_else(|| "backlight non trovato".to_string())?;
-        write_str(p.join("brightness"), &v.to_string())
+        let p = backlight_path().ok_or_else(|| "backlight non trovato".to_string())?;
+        write_str(p.join("brightness"), &value.min(bl.max_brightness).to_string())
     }
 
     pub fn set_fan_curve(&self, fan: u8, points: &[CurvePoint], enabled: bool) -> HwResult<()> {
@@ -517,24 +801,7 @@ impl Hardware {
             return write_str(curve.join(format!("pwm{fan}_enable")), "2");
         }
 
-        if points.len() != 8 {
-            return Err("la curva deve avere esattamente 8 punti".to_string());
-        }
-        let mut prev_temp = 0u8;
-        let mut prev_pwm = 0u8;
-        for (i, p) in points.iter().enumerate() {
-            if p.temp > 120 {
-                return Err(format!("punto {}: temperatura troppo alta ({}°C)", i + 1, p.temp));
-            }
-            if p.temp < prev_temp {
-                return Err(format!("punto {}: le temperature devono essere crescenti", i + 1));
-            }
-            if p.pwm < prev_pwm {
-                return Err(format!("punto {}: i valori PWM devono essere crescenti", i + 1));
-            }
-            prev_temp = p.temp;
-            prev_pwm = p.pwm;
-        }
+        validate_curve(points)?;
 
         for (i, p) in points.iter().enumerate() {
             write_str(curve.join(format!("pwm{fan}_auto_point{}_pwm", i + 1)), &p.pwm.to_string())?;
@@ -545,17 +812,186 @@ impl Hardware {
         write_str(curve.join(format!("pwm{fan}_enable")), "1")
     }
 
-    pub fn set_profile(&self, profile: &str) -> HwResult<()> {
+    fn write_profile(&self, profile: &str) -> HwResult<()> {
+        write_str("/sys/firmware/acpi/platform_profile", profile)
+    }
+
+    fn disable_manual_fans(&self) -> HwResult<()> {
+        let mut errors = Vec::new();
+        for fan in 1..=2 {
+            if let Err(e) = self.set_fan_curve(fan, &[], false) {
+                errors.push(e);
+            }
+        }
+        if let Err(e) = self.set_ppt(5, 5) {
+            errors.push(format!("PPT: {e}"));
+        }
+        if let Err(e) = self.set_nv_limits(75, 5) {
+            errors.push(format!("NVIDIA: {e}"));
+        }
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    }
+
+    pub fn set_profile(&mut self, profile: &str) -> HwResult<()> {
         let state = profile_state();
         if !state.choices.iter().any(|c| c == profile) {
             return Err(format!("profilo non valido: {profile}"));
         }
-        write_str("/sys/firmware/acpi/platform_profile", profile)
+        self.write_profile(profile)?;
+        if self.config.manual_enabled {
+            self.config.manual_enabled = false;
+            let _ = self.disable_manual_fans();
+        }
+        self.config.operating_mode = mode_from_profile(profile);
+        save_config(&self.config)?;
+        Ok(())
     }
 
-    pub fn set_charge_limit(&self, value: u8) -> HwResult<()> {
+    pub fn set_operating_mode(&mut self, mode: &str) -> HwResult<()> {
+        match mode {
+            "windows" | "performance" | "silent" | "turbo" => {
+                let profile = match mode {
+                    "silent" => "quiet",
+                    "turbo" => "performance",
+                    _ => "balanced",
+                };
+                if self.config.manual_enabled {
+                    self.config.manual_enabled = false;
+                    self.disable_manual_fans()?;
+                }
+                self.write_profile(profile)?;
+                self.config.operating_mode = mode.to_string();
+                save_config(&self.config)
+            }
+            "manual" => {
+                self.config.manual_enabled = true;
+                self.config.operating_mode = "manual".to_string();
+                self.write_profile("performance")?;
+                save_config(&self.config)?;
+                self.apply_manual_for_current_source()
+            }
+            other => Err(format!("modalità operativa non valida: {other}")),
+        }
+    }
+
+    pub fn set_gpu_mode(&mut self, mode: &str) -> HwResult<()> {
+        let (mux, dgpu) = match mode {
+            "ultimate" => (Some("1"), Some("0")),
+            "standard" => (Some("0"), Some("0")),
+            "eco" => (None, Some("1")),
+            "optimized" => (Some("0"), Some("0")),
+            other => return Err(format!("modalità GPU non valida: {other}")),
+        };
+        let mut errors = Vec::new();
+        if let Some(v) = mux {
+            if let Err(e) = set_fw_attr("gpu_mux_mode", v) {
+                errors.push(e);
+            }
+        }
+        if let Some(v) = dgpu {
+            if let Err(e) = set_fw_attr("dgpu_disable", v) {
+                errors.push(e);
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors.join("; "));
+        }
+        self.config.gpu_mode = mode.to_string();
+        save_config(&self.config)
+    }
+
+    pub fn set_ppt(&self, spl: u8, sppt: u8) -> HwResult<()> {
+        let spl = spl.clamp(5, 90);
+        let sppt = sppt.clamp(5, 90);
+        write_str(format!("{WMI}/ppt_pl1_spl"), &spl.to_string())?;
+        write_str(format!("{WMI}/ppt_pl2_sppt"), &sppt.to_string())
+    }
+
+    pub fn set_nv_limits(&self, temp_target: u8, dynamic_boost: u8) -> HwResult<()> {
+        let temp = temp_target.clamp(60, 90);
+        let boost = dynamic_boost.clamp(0, 25);
+        write_str(format!("{WMI}/nv_temp_target"), &temp.to_string())?;
+        write_str(format!("{WMI}/nv_dynamic_boost"), &boost.to_string())
+    }
+
+    pub fn save_manual_profile(
+        &mut self,
+        source: &str,
+        cpu: Vec<CurvePoint>,
+        gpu: Vec<CurvePoint>,
+        nv_temp_target: u8,
+        nv_dynamic_boost: u8,
+        spl: u8,
+        sppt: u8,
+    ) -> HwResult<()> {
+        validate_curve(&cpu)?;
+        validate_curve(&gpu)?;
+        let profile = ManualProfile {
+            cpu,
+            gpu,
+            nv_temp_target: nv_temp_target.clamp(60, 90),
+            nv_dynamic_boost: nv_dynamic_boost.clamp(0, 25),
+            spl: spl.clamp(5, 90),
+            sppt: sppt.clamp(5, 90),
+        };
+        match source {
+            "ac" => self.config.manual_ac = profile.clone(),
+            "battery" => self.config.manual_battery = profile.clone(),
+            other => return Err(format!("sorgente non valida: {other}")),
+        }
+        save_config(&self.config)?;
+        if self.config.manual_enabled && source == source_name() {
+            self.apply_manual_profile(&profile)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_manual_enabled(&mut self, enabled: bool) -> HwResult<()> {
+        if enabled {
+            self.config.manual_enabled = true;
+            self.config.operating_mode = "manual".to_string();
+            self.write_profile("performance")?;
+            save_config(&self.config)?;
+            self.apply_manual_for_current_source()
+        } else {
+            self.config.manual_enabled = false;
+            self.config.operating_mode = mode_from_profile(&profile_state().current);
+            save_config(&self.config)?;
+            self.disable_manual_fans()
+        }
+    }
+
+    pub fn apply_manual_for_current_source(&self) -> HwResult<()> {
+        let profile = if ac_online() {
+            &self.config.manual_ac
+        } else {
+            &self.config.manual_battery
+        };
+        self.apply_manual_profile(profile)
+    }
+
+    fn apply_manual_profile(&self, profile: &ManualProfile) -> HwResult<()> {
+        let mut errors = Vec::new();
+        if let Err(e) = self.set_fan_curve(1, &profile.cpu, true) {
+            errors.push(format!("CPU fan: {e}"));
+        }
+        if let Err(e) = self.set_fan_curve(2, &profile.gpu, true) {
+            errors.push(format!("GPU fan: {e}"));
+        }
+        if let Err(e) = self.set_ppt(profile.spl, profile.sppt) {
+            errors.push(format!("PPT: {e}"));
+        }
+        if let Err(e) = self.set_nv_limits(profile.nv_temp_target, profile.nv_dynamic_boost) {
+            errors.push(format!("NVIDIA: {e}"));
+        }
+        if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    }
+
+    pub fn set_charge_limit(&mut self, value: u8) -> HwResult<()> {
         let v = value.clamp(20, 100);
-        write_str(format!("{BAT}/charge_control_end_threshold"), &v.to_string())
+        write_str(format!("{BAT}/charge_control_end_threshold"), &v.to_string())?;
+        self.config.charge_limit = v;
+        save_config(&self.config)
     }
 
     pub fn set_panel_overdrive(&self, value: bool) -> HwResult<()> {

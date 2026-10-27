@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -7,6 +8,7 @@ use eframe::egui;
 use egui::{
     Align2, Color32, CornerRadius, FontId, Frame, Margin, RichText, Stroke, TextStyle,
 };
+use serde::{Deserialize, Serialize};
 
 use rog_control::protocol::*;
 
@@ -70,6 +72,7 @@ fn rpc(command: Command) -> Result<State, String> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Home,
     Keyboard,
     Fans,
     Power,
@@ -81,6 +84,7 @@ enum Tab {
 impl Tab {
     fn label(self) -> &'static str {
         match self {
+            Tab::Home => "Home",
             Tab::Keyboard => "Tastiera",
             Tab::Fans => "Ventole",
             Tab::Power => "Alimentazione",
@@ -128,10 +132,196 @@ impl FanDraft {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct SessionConfig {
+    screen_saver: bool,
+    touchpad_enabled: bool,
+    win_key_enabled: bool,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self { screen_saver: false, touchpad_enabled: true, win_key_enabled: true }
+    }
+}
+
+#[derive(Clone)]
+struct DisplayInfo {
+    output: String,
+    mode: String,
+    current: f32,
+    min: f32,
+    max: f32,
+}
+
+fn session_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(PathBuf::from(home).join(".config/rog-control/session.json"))
+}
+
+fn load_session() -> SessionConfig {
+    session_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn store_session(cfg: &SessionConfig) {
+    let Some(path) = session_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn run_cmd(command: &str, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new(command)
+        .args(args)
+        .output()
+        .map_err(|e| format!("{command}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn touchpad_id() -> Option<String> {
+    let out = run_cmd("xinput", &["list"]).ok()?;
+    for line in out.lines() {
+        if line.to_lowercase().contains("touchpad") {
+            if let Some(pos) = line.find("id=") {
+                return line[pos + 3..]
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string);
+            }
+        }
+    }
+    None
+}
+
+fn read_touchpad() -> Option<bool> {
+    let id = touchpad_id()?;
+    let out = run_cmd("xinput", &["list-props", &id]).ok()?;
+    for line in out.lines() {
+        if line.contains("Device Enabled") {
+            let value = line.rsplit(':').next()?.trim();
+            return Some(value == "1");
+        }
+    }
+    None
+}
+
+fn set_touchpad(enabled: bool) -> Result<(), String> {
+    let id = touchpad_id().ok_or_else(|| "touchpad non trovato".to_string())?;
+    run_cmd(
+        "xinput",
+        &["set-prop", &id, "Device Enabled", if enabled { "1" } else { "0" }],
+    )
+    .map(|_| ())
+}
+
+fn super_keycode() -> Option<u32> {
+    let out = run_cmd("xmodmap", &["-pk"]).ok()?;
+    for line in out.lines() {
+        if line.contains("Super_L") {
+            return line.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+fn read_win_key() -> Option<bool> {
+    let out = run_cmd("xmodmap", &["-pk"]).ok()?;
+    Some(out.lines().any(|l| l.contains("Super_L")))
+}
+
+fn set_win_key(enabled: bool) -> Result<(), String> {
+    let code = super_keycode().ok_or_else(|| "tasto Super non trovato".to_string())?;
+    let expr = if enabled {
+        format!("keycode {code} = Super_L")
+    } else {
+        format!("keycode {code} = NoSymbol")
+    };
+    run_cmd("xmodmap", &["-e", &expr]).map(|_| ())
+}
+
+fn display_info() -> Option<DisplayInfo> {
+    let out = run_cmd("xrandr", &["--query"]).ok()?;
+    let mut output: Option<String> = None;
+    let mut mode = String::new();
+    let mut rates: Vec<f32> = Vec::new();
+    let mut current = 0.0f32;
+
+    for line in out.lines() {
+        if line.contains(" connected") && !line.contains("disconnected") {
+            output = line.split_whitespace().next().map(str::to_string);
+            rates.clear();
+            current = 0.0;
+            continue;
+        }
+        if output.is_none() {
+            continue;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            // fine del blocco dell'output
+            if !rates.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let Some(mode_token) = tokens.next() else { continue };
+        let mut line_is_current = false;
+        for token in tokens {
+            let is_current = token.contains('*');
+            let cleaned = token.trim_matches(|c| c == '*' || c == '+');
+            if let Ok(rate) = cleaned.parse::<f32>() {
+                rates.push(rate);
+                if is_current {
+                    current = rate;
+                    line_is_current = true;
+                }
+            }
+        }
+        if line_is_current {
+            mode = mode_token.to_string();
+        }
+    }
+
+    let output = output?;
+    if rates.is_empty() {
+        return None;
+    }
+    let min = rates.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = rates.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    Some(DisplayInfo { output, mode, current, min, max })
+}
+
+fn set_refresh(info: &DisplayInfo, rate: f32) -> Result<(), String> {
+    run_cmd(
+        "xrandr",
+        &[
+            "--output",
+            &info.output,
+            "--mode",
+            &info.mode,
+            "--rate",
+            &format!("{rate:.2}"),
+        ],
+    )
+    .map(|_| ())
+}
+
 #[derive(Clone)]
 enum ConfirmAction {
-    Dgpu(bool),
-    Mux(u8),
+    GpuMode(String),
 }
 
 struct Toast {
@@ -153,6 +343,16 @@ struct App {
     fans: [FanDraft; 2],
     charge_limit: u8,
     display_brightness: u32,
+    ppt_spl: u8,
+    ppt_sppt: u8,
+    nv_temp: u8,
+    nv_boost: u8,
+    touchpad_enabled: bool,
+    screen_saver: bool,
+    win_key_enabled: bool,
+    display: Option<DisplayInfo>,
+    last_ac: Option<bool>,
+    last_session: Instant,
     confirm: Option<ConfirmAction>,
     toast: Option<Toast>,
     last_poll: Instant,
@@ -162,10 +362,11 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_style(&cc.egui_ctx);
+        let session = load_session();
         let mut app = Self {
             state: None,
             error: None,
-            tab: Tab::Keyboard,
+            tab: Tab::Home,
             aura_mode: 0,
             aura_c1: [255, 40, 60],
             aura_c2: [0, 0, 255],
@@ -178,13 +379,34 @@ impl App {
             ],
             charge_limit: 100,
             display_brightness: 100,
+            ppt_spl: 5,
+            ppt_sppt: 5,
+            nv_temp: 75,
+            nv_boost: 5,
+            touchpad_enabled: session.touchpad_enabled,
+            screen_saver: session.screen_saver,
+            win_key_enabled: session.win_key_enabled,
+            display: display_info(),
+            last_ac: None,
+            last_session: Instant::now(),
             confirm: None,
             toast: None,
             last_poll: Instant::now(),
             drafts_ready: false,
         };
         app.refresh();
+        app.sync_session_info();
         app
+    }
+
+    fn sync_session_info(&mut self) {
+        if let Some(v) = read_touchpad() {
+            self.touchpad_enabled = v;
+        }
+        if let Some(v) = read_win_key() {
+            self.win_key_enabled = v;
+        }
+        self.display = display_info();
     }
 
     fn refresh(&mut self) {
@@ -216,10 +438,34 @@ impl App {
             }
         }
         self.charge_limit = state.battery.charge_limit;
+        self.ppt_spl = state.ppt.spl;
+        self.ppt_sppt = state.ppt.sppt;
+        self.nv_temp = state.gpu.nv_temp_target;
+        self.nv_boost = state.gpu.nv_dynamic_boost;
         if let Some(bl) = &state.backlight {
             self.display_brightness = bl.brightness;
         }
         self.drafts_ready = true;
+    }
+
+    fn apply_screen_policy(&mut self, ac: bool) {
+        if !self.screen_saver {
+            return;
+        }
+        let Some(info) = self.display.clone() else { return };
+        let target = if ac { info.max } else { info.min };
+        if (info.current - target).abs() > 0.5 {
+            match set_refresh(&info, target) {
+                Ok(()) => self.notify(format!(
+                    "Schermo a {target:.0} Hz ({})",
+                    if ac { "AC" } else { "batteria" }
+                )),
+                Err(e) => {
+                    self.toast = Some(Toast { text: e, error: true, at: Instant::now() });
+                }
+            }
+            self.display = display_info();
+        }
     }
 
     fn send(&mut self, command: Command) {
@@ -351,6 +597,7 @@ impl App {
                 ui.add_space(8.0);
 
                 for tab in [
+                    Tab::Home,
                     Tab::Keyboard,
                     Tab::Fans,
                     Tab::Power,
@@ -454,31 +701,28 @@ impl App {
             .show(ctx, |ui| {
                 ui.set_width(360.0);
                 match &action {
-                    ConfirmAction::Dgpu(v) => {
-                        ui.label(
-                            RichText::new(if *v {
-                                "Disattivare la GPU NVIDIA dedicata?"
-                            } else {
-                                "Riattivare la GPU NVIDIA dedicata?"
-                            })
-                            .strong(),
-                        );
+                    ConfirmAction::GpuMode(mode) => {
+                        let (title, detail) = match mode.as_str() {
+                            "ultimate" => (
+                                "Passare a Ultimate (solo dGPU)?",
+                                "Massime prestazioni video, consumi più alti. Richiede un riavvio.",
+                            ),
+                            "eco" => (
+                                "Passare a Eco (dGPU disattivata)?",
+                                "Massima autonomia e meno calore; la GPU NVIDIA non sarà disponibile. Richiede un riavvio.",
+                            ),
+                            "optimized" => (
+                                "Passare a Ottimizzato?",
+                                "Hybrid/Optimus con gestione dinamica della dGPU da parte di Linux. Potrebbe richiedere un riavvio se cambia il mux.",
+                            ),
+                            _ => (
+                                "Passare a Standard (Hybrid/Optimus)?",
+                                "La dGPU resta disponibile su richiesta. Richiede un riavvio se cambia il mux.",
+                            ),
+                        };
+                        ui.label(RichText::new(title).strong());
                         ui.add_space(6.0);
-                        ui.label(
-                            "La modifica viene applicata dal firmware al riavvio. Con la dGPU disattivata nvidia-smi e il rendering NVIDIA non saranno disponibili.",
-                        );
-                    }
-                    ConfirmAction::Mux(v) => {
-                        ui.label(
-                            RichText::new(if *v == 1 {
-                                "Passare alla modalità Ultimate (solo dGPU)?"
-                            } else {
-                                "Passare alla modalità Hybrid (Optimus)?"
-                            })
-                            .strong(),
-                        );
-                        ui.add_space(6.0);
-                        ui.label("Richiede un riavvio. Verifica di avere un desktop funzionante con la GPU selezionata.");
+                        ui.label(detail);
                     }
                 }
                 ui.add_space(12.0);
@@ -492,13 +736,9 @@ impl App {
                     {
                         self.confirm = None;
                         match action {
-                            ConfirmAction::Dgpu(v) => {
-                                self.send(Command::SetDgpuDisabled { value: v });
-                                self.notify("Impostazione GPU salvata: riavvia per applicarla");
-                            }
-                            ConfirmAction::Mux(v) => {
-                                self.send(Command::SetGpuMux { value: v });
-                                self.notify("Modalità mux salvata: riavvia per applicarla");
+                            ConfirmAction::GpuMode(mode) => {
+                                self.send(Command::SetGpuMode { mode });
+                                self.notify("Modalità GPU salvata: riavvia se richiesto");
                             }
                         }
                     }
@@ -507,6 +747,225 @@ impl App {
         if !open {
             self.confirm = None;
         }
+    }
+
+    fn home_page(&mut self, ui: &mut egui::Ui, state: &State) {
+        page_header(ui, "Home", "Panoramica, modalità operative e statistiche");
+        ui.add_space(12.0);
+
+        card(ui, |ui| {
+            ui.label(RichText::new("Modalità operativa").size(16.0).strong());
+            ui.label(
+                RichText::new("Profili del firmware, come in Armoury Crate.")
+                    .weak()
+                    .size(12.0),
+            );
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                for (key, title, desc) in OPERATING_MODES {
+                    let selected = state.operating_mode == *key;
+                    let fill = if selected { ACCENT_SOFT } else { Color32::from_rgb(30, 30, 37) };
+                    let stroke = if selected { Stroke::new(1.5, ACCENT) } else { Stroke::NONE };
+                    let response = ui.add(
+                        egui::Button::new(
+                            RichText::new(format!("{title}\n{desc}"))
+                                .size(12.0)
+                                .color(if selected { Color32::WHITE } else { Color32::from_rgb(190, 190, 200) }),
+                        )
+                        .fill(fill)
+                        .stroke(stroke)
+                        .min_size(egui::vec2(174.0, 62.0)),
+                    );
+                    if response.clicked() {
+                        self.send(Command::SetOperatingMode { mode: key.to_string() });
+                        self.notify(format!("Modalità: {title}"));
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "Windows e Prestazioni usano il profilo ACPI bilanciato; Turbo usa performance. Manuale applica curve e limiti salvati per AC/batteria.",
+                )
+                .size(11.0)
+                .weak(),
+            );
+        });
+
+        ui.add_space(14.0);
+        ui.columns(2, |cols| {
+            card(&mut cols[0], |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("CPU").size(16.0).strong());
+                    ui.label(RichText::new(&state.system.model).size(11.0).weak());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        stat(ui, "Frequenza", &format!("{:.2} GHz", state.cpu.freq_mhz / 1000.0));
+                        ui.add_space(18.0);
+                        stat(ui, "Utilizzo", &format!("{:.0} %", state.cpu.usage_pct));
+                        ui.add_space(18.0);
+                        stat(
+                            ui,
+                            "Temperatura",
+                            &self
+                                .cpu_temp()
+                                .map(|t| format!("{t:.0} °C"))
+                                .unwrap_or_else(|| "—".into()),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Governor: {}   ·   Load: {:.2}",
+                            state.system.cpu_governor, state.system.load1
+                        ))
+                        .size(11.0)
+                        .weak(),
+                    );
+                });
+            });
+
+            card(&mut cols[1], |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("GPU").size(16.0).strong());
+                    if let Some(n) = &state.nvidia {
+                        ui.label(RichText::new(&n.name).size(11.0).weak());
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            stat(ui, "Frequenza", &format!("{:.0} MHz", n.clock_mhz));
+                            ui.add_space(14.0);
+                            stat(ui, "Utilizzo", &format!("{:.0} %", n.util_pct));
+                            ui.add_space(14.0);
+                            stat(ui, "Temperatura", &format!("{:.0} °C", n.temp_c));
+                        });
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Core {:.0} MHz · Mem {:.0} MHz · Potenza {:.0} W / max {:.0} W · VRAM {:.0}/{:.0} MB",
+                                n.clock_mhz,
+                                n.mem_clock_mhz,
+                                n.power_w,
+                                n.max_power_limit_w,
+                                n.mem_used_mb,
+                                n.mem_total_mb
+                            ))
+                            .size(11.0)
+                            .weak(),
+                        );
+                    } else {
+                        ui.label(RichText::new("dGPU non disponibile o disattivata.").weak().size(12.0));
+                    }
+                });
+            });
+        });
+
+        ui.add_space(14.0);
+        ui.columns(2, |cols| {
+            card(&mut cols[0], |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Ventole").size(16.0).strong());
+                    ui.add_space(8.0);
+                    for fan in &state.fans {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{}:", fan.label)).size(12.0));
+                            ui.label(RichText::new(format!("{} RPM", fan.rpm)).size(14.0).strong().color(ACCENT));
+                            ui.label(
+                                RichText::new(if fan.custom { "custom" } else { "auto BIOS" })
+                                    .size(11.0)
+                                    .weak(),
+                            );
+                        });
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Pressione acustica: non esposta dall'EC su Linux.")
+                            .size(10.0)
+                            .weak(),
+                    );
+                });
+            });
+
+            card(&mut cols[1], |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Memoria e archiviazione").size(16.0).strong());
+                    ui.add_space(6.0);
+                    let mem_pct = if state.memory.total_mb > 0 {
+                        state.memory.used_mb as f32 / state.memory.total_mb as f32 * 100.0
+                    } else {
+                        0.0
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "RAM: {:.1} / {:.1} GB ({:.0} %)",
+                            state.memory.used_mb as f32 / 1024.0,
+                            state.memory.total_mb as f32 / 1024.0,
+                            mem_pct
+                        ))
+                        .size(12.0),
+                    );
+                    ui.add(
+                        egui::ProgressBar::new(mem_pct / 100.0)
+                            .desired_width(ui.available_width())
+                            .text(format!("{mem_pct:.0} %")),
+                    );
+                    ui.add_space(8.0);
+                    let disk_pct = if state.storage.total_gb > 0.0 {
+                        state.storage.used_gb / state.storage.total_gb * 100.0
+                    } else {
+                        0.0
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "Disco: {:.1} / {:.1} GB ({:.0} %)",
+                            state.storage.used_gb, state.storage.total_gb, disk_pct
+                        ))
+                        .size(12.0),
+                    );
+                    ui.add(
+                        egui::ProgressBar::new(disk_pct / 100.0)
+                            .desired_width(ui.available_width())
+                            .text(format!("{disk_pct:.0} %")),
+                    );
+                });
+            });
+        });
+
+        ui.add_space(14.0);
+        ui.columns(2, |cols| {
+            card(&mut cols[0], |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Batteria").size(16.0).strong());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        stat(ui, "Carica", &format!("{} %", state.battery.capacity));
+                        ui.add_space(20.0);
+                        stat(ui, "Stato", &state.battery.status);
+                        ui.add_space(20.0);
+                        stat(ui, "Consumo", &format!("{:.1} W", state.battery.power_now_w));
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(if state.battery.ac_online {
+                            "Alimentazione da rete"
+                        } else {
+                            "Alimentazione a batteria"
+                        })
+                        .size(12.0)
+                        .color(if state.battery.ac_online { GREEN } else { YELLOW }),
+                    );
+                });
+            });
+
+            card(&mut cols[1], |ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Piattaforma").size(16.0).strong());
+                    ui.add_space(6.0);
+                    row(ui, "Modello", &state.system.model);
+                    row(ui, "Kernel", &state.system.kernel);
+                    row(ui, "Sistema", &state.system.os);
+                });
+            });
+        });
     }
 
     fn keyboard_page(&mut self, ui: &mut egui::Ui, state: &State) {
@@ -575,6 +1034,13 @@ impl App {
                 )
                 .weak()
                 .size(12.0),
+            );
+            ui.label(
+                RichText::new(
+                    "Aura Sync, effetti AI/Musica e Aura Creator richiedono Armoury Crate: qui sono disponibili tutti gli effetti hardware.",
+                )
+                .size(11.0)
+                .weak(),
             );
             ui.add_space(12.0);
 
@@ -776,30 +1242,36 @@ impl App {
     }
 
     fn power_page(&mut self, ui: &mut egui::Ui, state: &State) {
-        page_header(ui, "Alimentazione", "Profilo termico e prestazioni della CPU");
+        page_header(ui, "Alimentazione", "Profili, limiti CPU/GPU e modalità manuale");
         ui.add_space(12.0);
 
         card(ui, |ui| {
-            ui.label(RichText::new("Profilo di sistema").size(16.0).strong());
-            ui.label(RichText::new("Gestito dal firmware tramite ACPI platform_profile.").weak().size(12.0));
-            ui.add_space(10.0);
+            ui.label(RichText::new("Profilo ACPI").size(16.0).strong());
+            ui.label(
+                RichText::new("Controllo diretto del firmware (quiet / balanced / performance).")
+                    .weak()
+                    .size(12.0),
+            );
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 for choice in &state.profile.choices {
                     let selected = profile_key(&state.profile.current) == profile_key(choice);
                     let (title, desc) = profile_text(choice);
                     let fill = if selected { ACCENT_SOFT } else { Color32::from_rgb(30, 30, 37) };
                     let stroke = if selected { Stroke::new(1.5, ACCENT) } else { Stroke::NONE };
-                    let response = ui.add(
-                        egui::Button::new(
-                            RichText::new(format!("{title}\n{desc}"))
-                                .size(12.0)
-                                .color(if selected { Color32::WHITE } else { Color32::from_rgb(190, 190, 200) }),
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("{title}\n{desc}"))
+                                    .size(12.0)
+                                    .color(if selected { Color32::WHITE } else { Color32::from_rgb(190, 190, 200) }),
+                            )
+                            .fill(fill)
+                            .stroke(stroke)
+                            .min_size(egui::vec2(180.0, 62.0)),
                         )
-                        .fill(fill)
-                        .stroke(stroke)
-                        .min_size(egui::vec2(180.0, 74.0)),
-                    );
-                    if response.clicked() {
+                        .clicked()
+                    {
                         self.send(Command::SetProfile { profile: choice.clone() });
                         self.notify(format!("Profilo impostato: {title}"));
                     }
@@ -809,14 +1281,96 @@ impl App {
 
         ui.add_space(14.0);
         card(ui, |ui| {
-            ui.label(RichText::new("CPU").size(16.0).strong());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Limiti CPU (PPT)").size(16.0).strong());
+                if state.ppt.auto {
+                    ui.label(RichText::new("auto firmware").size(11.0).color(YELLOW));
+                }
+            });
+            ui.label(
+                RichText::new("SPL = limite sostenuto, SPPT = limite di breve durata. 5 W significa auto/default.")
+                    .weak()
+                    .size(12.0),
+            );
             ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("SPL");
+                ui.add(egui::Slider::new(&mut self.ppt_spl, 5..=90).suffix(" W"));
+                ui.add_space(16.0);
+                ui.label("SPPT");
+                ui.add(egui::Slider::new(&mut self.ppt_sppt, 5..=90).suffix(" W"));
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new("Applica limiti").strong()).fill(ACCENT))
+                    .clicked()
+                {
+                    self.send(Command::SetPpt { spl: self.ppt_spl, sppt: self.ppt_sppt });
+                    self.notify("Limiti CPU applicati");
+                }
+                if ui.button("Ripristina auto").clicked() {
+                    self.ppt_spl = 5;
+                    self.ppt_sppt = 5;
+                    self.send(Command::SetPpt { spl: 5, sppt: 5 });
+                    self.notify("Limiti CPU in auto");
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("FPPT e APU SPPT non sono esposti dal kernel su questo modello.")
+                    .size(11.0)
+                    .weak(),
+            );
+        });
+
+        ui.add_space(14.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("Limiti GPU NVIDIA").size(16.0).strong());
+            ui.label(
+                RichText::new("Thermal target e Dynamic Boost (WMI asus-nb-wmi).")
+                    .weak()
+                    .size(12.0),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Thermal target");
+                ui.add(egui::Slider::new(&mut self.nv_temp, 60..=90).suffix(" °C"));
+                ui.add_space(16.0);
+                ui.label("Dynamic Boost");
+                ui.add(egui::Slider::new(&mut self.nv_boost, 0..=25).suffix(" W"));
+            });
+            ui.add_space(8.0);
+            if ui
+                .add(egui::Button::new(RichText::new("Applica limiti GPU").strong()).fill(ACCENT))
+                .clicked()
+            {
+                self.send(Command::SetNvLimits {
+                    temp_target: self.nv_temp,
+                    dynamic_boost: self.nv_boost,
+                });
+                self.notify("Limiti GPU applicati");
+            }
+            ui.label(
+                RichText::new(format!(
+                    "Valori attuali: {} °C, {} W.",
+                    state.gpu.nv_temp_target, state.gpu.nv_dynamic_boost
+                ))
+                .size(11.0)
+                .weak(),
+            );
+        });
+
+        ui.add_space(14.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("CPU").size(16.0).strong());
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("Governor:");
                 ui.label(RichText::new(&state.system.cpu_governor).monospace().color(ACCENT));
             });
             if let Some(mut boost) = state.system.cpu_boost {
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 if ui.checkbox(&mut boost, "CPU Boost (amd-pstate)").changed() {
                     self.send(Command::SetCpuBoost { value: boost });
                     self.notify(if boost { "CPU Boost attivato" } else { "CPU Boost disattivato" });
@@ -826,15 +1380,72 @@ impl App {
 
         ui.add_space(14.0);
         card(ui, |ui| {
-            ui.label(RichText::new("Limiti di potenza (PPT)").size(16.0).strong());
-            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Modalità manuale").size(16.0).strong());
+                let mut enabled = state.manual.enabled;
+                if ui.checkbox(&mut enabled, "attiva").changed() {
+                    self.send(Command::SetManualEnabled { enabled });
+                    self.notify(if enabled {
+                        "Modalità manuale attiva"
+                    } else {
+                        "Modalità manuale disattivata (ventole auto)"
+                    });
+                }
+            });
             ui.label(
                 RichText::new(
-                    "Questo firmware non espone i limiti PPT tramite asus-armoury (letture ENODEV). Il controllo resta quindi affidato ai profili ACPI/BIOS.",
+                    "Salva curve ventole, PPT e limiti NVIDIA per AC e batteria. Il demone li applica automaticamente al cambio di alimentazione.",
                 )
                 .weak()
                 .size(12.0),
             );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Salva impostazioni correnti per AC").clicked() {
+                    self.save_manual("ac");
+                }
+                if ui.button("Salva impostazioni correnti per batteria").clicked() {
+                    self.save_manual("battery");
+                }
+                if ui.button("Applica profilo ora").clicked() {
+                    self.send(Command::SetManualEnabled { enabled: true });
+                    self.notify("Profilo manuale applicato");
+                }
+            });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "Sorgente attuale: {}. Profilo AC: {} | Profilo batteria: {}",
+                    if state.manual.source == "ac" { "rete" } else { "batteria" },
+                    manual_summary(&state.manual.ac),
+                    manual_summary(&state.manual.battery)
+                ))
+                .size(11.0)
+                .weak(),
+            );
+        });
+    }
+
+    fn save_manual(&mut self, source: &str) {
+        for draft in &self.fans {
+            if let Err(e) = draft.validate() {
+                self.toast = Some(Toast { text: e, error: true, at: Instant::now() });
+                return;
+            }
+        }
+        self.send(Command::SaveManualProfile {
+            source: source.to_string(),
+            cpu: self.fans[0].points(),
+            gpu: self.fans[1].points(),
+            nv_temp_target: self.nv_temp,
+            nv_dynamic_boost: self.nv_boost,
+            spl: self.ppt_spl,
+            sppt: self.ppt_sppt,
+        });
+        self.notify(if source == "ac" {
+            "Profilo manuale AC salvato"
+        } else {
+            "Profilo manuale batteria salvato"
         });
     }
 
@@ -907,7 +1518,7 @@ impl App {
     }
 
     fn gpu_page(&mut self, ui: &mut egui::Ui, state: &State) {
-        page_header(ui, "GPU e display", "Mux, risparmio energetico, overdrive e luminosità pannello");
+        page_header(ui, "GPU e display", "Modalità grafica, luminosità pannello e statistiche NVIDIA");
         ui.add_space(12.0);
 
         if state.gpu.pending_reboot {
@@ -921,6 +1532,47 @@ impl App {
             ui.add_space(10.0);
         }
 
+        card(ui, |ui| {
+            ui.label(RichText::new("Modalità GPU").size(16.0).strong());
+            ui.label(
+                RichText::new("Come in Armoury Crate. Ultimate/Eco richiedono un riavvio.")
+                    .weak()
+                    .size(12.0),
+            );
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                for (key, title, desc) in GPU_MODES {
+                    let selected = state.gpu.mode == *key;
+                    let fill = if selected { ACCENT_SOFT } else { Color32::from_rgb(30, 30, 37) };
+                    let stroke = if selected { Stroke::new(1.5, ACCENT) } else { Stroke::NONE };
+                    let response = ui.add(
+                        egui::Button::new(
+                            RichText::new(format!("{title}\n{desc}"))
+                                .size(12.0)
+                                .color(if selected { Color32::WHITE } else { Color32::from_rgb(190, 190, 200) }),
+                        )
+                        .fill(fill)
+                        .stroke(stroke)
+                        .min_size(egui::vec2(196.0, 72.0)),
+                    );
+                    if response.clicked() && !selected {
+                        self.confirm = Some(ConfirmAction::GpuMode(key.to_string()));
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "Mux attuale: {} · dGPU {}",
+                    if state.gpu.mux_mode == 1 { "Ultimate" } else { "Hybrid" },
+                    if state.gpu.dgpu_disabled { "disattivata" } else { "attiva" }
+                ))
+                .size(11.0)
+                .weak(),
+            );
+        });
+
+        ui.add_space(14.0);
         card(ui, |ui| {
             ui.label(RichText::new("Display").size(16.0).strong());
             if let Some(bl) = &state.backlight {
@@ -938,46 +1590,15 @@ impl App {
             } else {
                 ui.label(RichText::new("Nessun backlight controllabile rilevato.").weak());
             }
-            ui.add_space(8.0);
-            let mut od = state.gpu.panel_overdrive;
-            if ui.checkbox(&mut od, "Panel Overdrive (riduce il tempo di risposta del pannello)").changed() {
-                self.send(Command::SetPanelOverdrive { value: od });
-            }
-            let mut sound = state.gpu.boot_sound;
-            if ui.checkbox(&mut sound, "Suono di avvio ASUS").changed() {
-                self.send(Command::SetBootSound { value: sound });
-            }
-        });
-
-        ui.add_space(14.0);
-        card(ui, |ui| {
-            ui.label(RichText::new("GPU dedicata").size(16.0).strong());
-            ui.label(RichText::new("Le modifiche vengono salvate dal firmware e applicate al riavvio.").weak().size(12.0));
-            ui.add_space(10.0);
-
-            let mut disabled = state.gpu.dgpu_disabled;
-            if ui.checkbox(&mut disabled, "Disattiva GPU NVIDIA (dGPU off)").changed() {
-                self.confirm = Some(ConfirmAction::Dgpu(disabled));
-            }
-
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label("Modalità grafica:");
-                let mut mux = state.gpu.mux_mode;
-                egui::ComboBox::from_id_salt("mux_mode")
-                    .selected_text(match state.gpu.mux_mode { 1 => "Ultimate (solo dGPU)", _ => "Hybrid (Optimus)" })
-                    .width(240.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut mux, 0, "Hybrid (Optimus)");
-                        ui.selectable_value(&mut mux, 1, "Ultimate (solo dGPU)");
-                    });
-                if mux != state.gpu.mux_mode {
-                    self.confirm = Some(ConfirmAction::Mux(mux));
-                }
-            });
-
-            if !state.gpu.dgpu_available {
-                ui.label(RichText::new("Attributo dgpu_disable non disponibile su questo firmware.").size(11.0).color(YELLOW));
+            if let Some(info) = &self.display {
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {} Hz attuali · range {:.0}–{:.0} Hz",
+                        info.output, info.current, info.min, info.max
+                    ))
+                    .size(11.0)
+                    .weak(),
+                );
             }
         });
 
@@ -989,21 +1610,122 @@ impl App {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     stat(ui, "Temperatura", &format!("{:.0} °C", n.temp_c));
-                    ui.add_space(20.0);
+                    ui.add_space(18.0);
                     stat(ui, "Utilizzo", &format!("{:.0} %", n.util_pct));
-                    ui.add_space(20.0);
+                    ui.add_space(18.0);
                     stat(ui, "Potenza", &format!("{:.1} W", n.power_w));
-                    ui.add_space(20.0);
-                    stat(ui, "Clock SM", &format!("{:.0} MHz", n.clock_mhz));
+                    ui.add_space(18.0);
+                    stat(ui, "TGP max", &format!("{:.0} W", n.max_power_limit_w));
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    stat(ui, "Clock core", &format!("{:.0} MHz", n.clock_mhz));
+                    ui.add_space(18.0);
+                    stat(ui, "Clock memoria", &format!("{:.0} MHz", n.mem_clock_mhz));
+                    ui.add_space(18.0);
+                    stat(
+                        ui,
+                        "VRAM",
+                        &format!("{:.1}/{:.1} GB", n.mem_used_mb / 1024.0, n.mem_total_mb / 1024.0),
+                    );
                 });
             });
         }
     }
 
     fn system_page(&mut self, ui: &mut egui::Ui, state: &State) {
-        page_header(ui, "Sistema", "Informazioni, sensori e stato del demone");
+        page_header(ui, "Sistema", "Configurazione, informazioni, sensori e stato del demone");
         ui.add_space(12.0);
 
+        card(ui, |ui| {
+            ui.label(RichText::new("Configurazione di sistema").size(16.0).strong());
+            ui.label(
+                RichText::new("Impostazioni hardware e della sessione desktop.")
+                    .weak()
+                    .size(12.0),
+            );
+            ui.add_space(10.0);
+
+            let mut sound = state.gpu.boot_sound;
+            if ui.checkbox(&mut sound, "Suono di avvio ASUS").changed() {
+                self.send(Command::SetBootSound { value: sound });
+            }
+            let mut od = state.gpu.panel_overdrive;
+            if ui.checkbox(&mut od, "Panel Overdrive (riduce il tempo di risposta)").changed() {
+                self.send(Command::SetPanelOverdrive { value: od });
+            }
+
+            ui.add_space(8.0);
+            if ui.checkbox(&mut self.touchpad_enabled, "Touchpad abilitato").changed() {
+                let desired = self.touchpad_enabled;
+                if let Err(e) = set_touchpad(desired) {
+                    self.touchpad_enabled = !desired;
+                    self.toast = Some(Toast { text: e, error: true, at: Instant::now() });
+                } else {
+                    self.notify(if desired { "Touchpad abilitato" } else { "Touchpad disabilitato" });
+                }
+                store_session(&SessionConfig {
+                    screen_saver: self.screen_saver,
+                    touchpad_enabled: self.touchpad_enabled,
+                    win_key_enabled: self.win_key_enabled,
+                });
+            }
+
+            if ui
+                .checkbox(
+                    &mut self.screen_saver,
+                    "Risparmio schermo: 60 Hz a batteria, refresh massimo con l'alimentatore",
+                )
+                .changed()
+            {
+                let enabled = self.screen_saver;
+                store_session(&SessionConfig {
+                    screen_saver: enabled,
+                    touchpad_enabled: self.touchpad_enabled,
+                    win_key_enabled: self.win_key_enabled,
+                });
+                if enabled {
+                    self.apply_screen_policy(state.battery.ac_online);
+                }
+                self.notify(if enabled {
+                    "Risparmio schermo attivo"
+                } else {
+                    "Risparmio schermo disattivato"
+                });
+            }
+            if let Some(info) = &self.display {
+                ui.label(
+                    RichText::new(format!(
+                        "{}: {} Hz (range {:.0}–{:.0} Hz, sorgente {})",
+                        info.output,
+                        info.current,
+                        info.min,
+                        info.max,
+                        if state.battery.ac_online { "rete" } else { "batteria" }
+                    ))
+                    .size(11.0)
+                    .weak(),
+                );
+            }
+
+            ui.add_space(8.0);
+            if ui.checkbox(&mut self.win_key_enabled, "Tasto Windows abilitato (solo X11)").changed() {
+                let desired = self.win_key_enabled;
+                if let Err(e) = set_win_key(desired) {
+                    self.win_key_enabled = !desired;
+                    self.toast = Some(Toast { text: e, error: true, at: Instant::now() });
+                } else {
+                    self.notify(if desired { "Tasto Windows abilitato" } else { "Tasto Windows disabilitato" });
+                }
+                store_session(&SessionConfig {
+                    screen_saver: self.screen_saver,
+                    touchpad_enabled: self.touchpad_enabled,
+                    win_key_enabled: self.win_key_enabled,
+                });
+            }
+        });
+
+        ui.add_space(14.0);
         card(ui, |ui| {
             ui.label(RichText::new("Piattaforma").size(16.0).strong());
             ui.add_space(8.0);
@@ -1093,6 +1815,17 @@ impl eframe::App for App {
         if self.last_poll.elapsed() >= Duration::from_secs(2) {
             self.refresh();
             self.last_poll = Instant::now();
+            let ac = self.state.as_ref().map(|s| s.battery.ac_online);
+            if let Some(ac) = ac {
+                if self.last_ac != Some(ac) {
+                    self.last_ac = Some(ac);
+                    self.apply_screen_policy(ac);
+                }
+            }
+        }
+        if self.tab == Tab::System && self.last_session.elapsed() >= Duration::from_secs(2) {
+            self.last_session = Instant::now();
+            self.sync_session_info();
         }
         // Le scritture sysfs sono immediate; un repaint periodico tiene vivi i sensori.
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -1114,6 +1847,7 @@ impl eframe::App for App {
                         return;
                     };
                     match self.tab {
+                        Tab::Home => self.home_page(ui, &state),
                         Tab::Keyboard => self.keyboard_page(ui, &state),
                         Tab::Fans => self.fans_page(ui, &state),
                         Tab::Power => self.power_page(ui, &state),
@@ -1326,17 +2060,39 @@ fn fan_graph(ui: &mut egui::Ui, draft: &FanDraft, current: Option<f32>) {
     }
 }
 
+const OPERATING_MODES: &[(&str, &str, &str)] = &[
+    ("windows", "Windows", "Controllo del sistema"),
+    ("silent", "Silenziosa", "Ventole lente, limiti ridotti"),
+    ("performance", "Prestazioni", "Bilanciata"),
+    ("turbo", "Turbo", "Massima potenza"),
+    ("manual", "Manuale", "Curve e limiti custom"),
+];
+
+const GPU_MODES: &[(&str, &str, &str)] = &[
+    ("ultimate", "Ultimate", "Solo dGPU, massime prestazioni"),
+    ("standard", "Standard", "Hybrid / Optimus"),
+    ("eco", "Eco", "dGPU off, massima autonomia"),
+    ("optimized", "Ottimizzato", "Hybrid con risparmio automatico"),
+];
+
+fn manual_summary(p: &ManualProfile) -> String {
+    format!(
+        "SPL {} W · SPPT {} W · GPU {} °C / {} W · ventole 8 punti",
+        p.spl, p.sppt, p.nv_temp_target, p.nv_dynamic_boost
+    )
+}
+
 const AURA_MODES: &[(&str, u8)] = &[
     ("Statico", 0),
-    ("Respira", 1),
-    ("Arcobaleno ciclico", 2),
-    ("Onda arcobaleno", 3),
+    ("Respiro", 1),
+    ("Stroboscopica", 12),
+    ("Ciclo colore", 2),
+    ("Arcobaleno", 3),
+    ("Cometa", 11),
+    ("Flash & Dash", 10),
     ("Stelle", 4),
     ("Pioggia", 5),
-    ("Evidenzia", 6),
+    ("Reattivo", 8),
     ("Laser", 7),
-    ("Ripple", 8),
-    ("Impulso", 10),
-    ("Cometa", 11),
-    ("Flash", 12),
+    ("Onda", 6),
 ];

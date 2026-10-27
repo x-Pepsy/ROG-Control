@@ -9,29 +9,38 @@ ACPI, hidraw), so it works on many ROG/Strix models.
 
 ## Features
 
+- **Home**
+  - Armoury-Crate-style operating modes: Windows, Silent, Performance, Turbo, Manual.
+  - Live CPU/GPU, fan, memory, storage, battery and platform overview.
 - **Keyboard**
   - Backlight brightness (0–3) via `/sys/class/leds/asus::kbd_backlight`.
-  - **Aura RGB** via hidraw (`0b05:19b6`): static, breathe, rainbow cycle/wave, stars,
-    rain, highlight, laser, ripple, pulse, comet, flash; primary and secondary colour,
-    speed and direction. Global effect only (this controller does not support the four
-    zones independently).
+  - **Aura RGB** via hidraw (`0b05:19b6`): static, breathe, stroboscopic, colour cycle,
+    rainbow, comet, flash & dash, stars, rain, reactive, laser, wave; primary and
+    secondary colour, speed and direction. Global effect only (this controller does
+    not support the four zones independently).
 - **Fans**
   - RPM and temperature for CPU and GPU.
   - Custom 8-point curve per fan, with chart and validation.
   - Return to the BIOS automatic mode.
 - **Power**
   - ACPI profiles: quiet / balanced / performance.
+  - CPU PPT limits (SPL/SPPT) through ASUS WMI.
+  - NVIDIA thermal target and Dynamic Boost.
+  - **Manual mode** with separate AC/battery profiles (fan curves, PPT, NVIDIA limits),
+    applied automatically when the power source changes.
   - CPU Boost (amd-pstate).
 - **Battery**
   - Percentage, status and power draw in watts.
-  - Charge limit (40–100%).
+  - **Persistent charge limit** (20–100%): restored by the daemon at every boot.
 - **GPU and display**
+  - Ultimate / Standard / Eco / Optimized modes (mux + dGPU disable).
   - Panel brightness.
   - Panel Overdrive and boot sound.
-  - dGPU off and Hybrid/Ultimate mux mode (with confirmation and reboot).
 - **System**
+  - Touchpad and Windows-key toggles (X11).
+  - Screen power saver: **60 Hz on battery, maximum refresh rate on AC** (360 Hz here).
   - Model, kernel, distro, uptime, load, governor.
-  - All hwmon sensors and NVIDIA statistics (`nvidia-smi`).
+  - All hwmon sensors, memory/storage usage and NVIDIA statistics.
 
 ## Architecture
 
@@ -44,7 +53,8 @@ ACPI, hidraw), so it works on many ROG/Strix models.
 
 The GUI does not run as root. The daemon only exposes explicit, validated commands
 (no arbitrary paths), and the socket is accessible to the `plugdev` group with
-`0660` permissions.
+`0660` permissions. The daemon also watches AC/battery changes to apply the matching
+manual profile.
 
 ## Installation
 
@@ -81,10 +91,15 @@ rog-control
   at startup (with a few retries, since the controller is a USB device).
 - Aura packets are the same ones used by `asusctl`: `5d b3` (effect), `5d b5`
   (set), `5d b4` (apply), sent as 64-byte reports.
-- PPT limits (`ppt_pl1_spl`, …) return `ENODEV` on this firmware: the section is
-  therefore informational and control remains with the ACPI profiles.
+- The `asus-armoury` PPT attributes return `ENODEV` on this board, but SPL/SPPT
+  are writable through the legacy `asus-nb-wmi` attributes (`ppt_pl1_spl`,
+  `ppt_pl2_sppt`). FPPT and APU SPPT are not exposed.
 - Fan curves use `pwmN_enable=1` (custom) / `2` (BIOS auto), with 8 increasing
-  temperature/PWM points.
+  temperature/PWM points. Manual profiles are stored in
+  `/var/lib/rog-control/config.json`.
+- The charge limit is stored in the same config and restored when the daemon starts.
+- Touchpad, Windows key and screen power saver are desktop features: they use
+  `xinput`, `xmodmap` and `xrandr`, so they currently require an X11 session.
 
 ## Uninstall
 

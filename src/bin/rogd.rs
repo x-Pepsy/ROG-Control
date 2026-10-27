@@ -56,6 +56,30 @@ fn handle_command(hw: &mut Hardware, command: Command) -> HwResult<()> {
             hw.set_fan_curve(fan, &points, enabled)
         }
         Command::SetProfile { profile } => hw.set_profile(&profile),
+        Command::SetOperatingMode { mode } => hw.set_operating_mode(&mode),
+        Command::SetGpuMode { mode } => hw.set_gpu_mode(&mode),
+        Command::SetPpt { spl, sppt } => hw.set_ppt(spl, sppt),
+        Command::SetNvLimits { temp_target, dynamic_boost } => {
+            hw.set_nv_limits(temp_target, dynamic_boost)
+        }
+        Command::SaveManualProfile {
+            source,
+            cpu,
+            gpu,
+            nv_temp_target,
+            nv_dynamic_boost,
+            spl,
+            sppt,
+        } => hw.save_manual_profile(
+            &source,
+            cpu,
+            gpu,
+            nv_temp_target,
+            nv_dynamic_boost,
+            spl,
+            sppt,
+        ),
+        Command::SetManualEnabled { enabled } => hw.set_manual_enabled(enabled),
         Command::SetChargeLimit { value } => hw.set_charge_limit(value),
         Command::SetPanelOverdrive { value } => hw.set_panel_overdrive(value),
         Command::SetBootSound { value } => hw.set_boot_sound(value),
@@ -101,6 +125,43 @@ fn handle_connection(stream: UnixStream, hw: &mut Hardware) {
     }
 }
 
+fn ac_online() -> bool {
+    fs::read_to_string("/sys/class/power_supply/ADP0/online")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Applica automaticamente il profilo manuale giusto quando cambia la sorgente
+/// di alimentazione (AC <-> batteria), come fa Armoury Crate.
+fn spawn_power_monitor() {
+    std::thread::spawn(|| {
+        let mut hw = Hardware::new();
+        if hw.config.manual_enabled {
+            if let Err(e) = hw.apply_manual_for_current_source() {
+                eprintln!("profilo manuale non applicato all'avvio: {e}");
+            }
+        }
+        let mut last = ac_online();
+        loop {
+            std::thread::sleep(Duration::from_secs(3));
+            let current = ac_online();
+            if current != last {
+                last = current;
+                hw.reload_config();
+                if hw.config.manual_enabled {
+                    match hw.apply_manual_for_current_source() {
+                        Ok(()) => eprintln!(
+                            "profilo manuale applicato per {}",
+                            if current { "AC" } else { "batteria" }
+                        ),
+                        Err(e) => eprintln!("cambio sorgente, profilo manuale non applicato: {e}"),
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn main() {
     let path = Path::new(SOCKET_PATH);
     let listener = match prepare_socket(path) {
@@ -113,6 +174,7 @@ fn main() {
 
     eprintln!("rog-control-daemon {} in ascolto su {}", DAEMON_VERSION, SOCKET_PATH);
     let mut hw = Hardware::new();
+    spawn_power_monitor();
 
     // Il controller RGB è un dispositivo USB: al boot può comparire dopo il demone.
     if hw.has_saved_aura() {
