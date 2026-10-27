@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ROG Control
+Comment=Controllo hardware per laptop ASUS ROG
+Exec=/usr/local/bin/rog-control
+Icon=rog-control
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+Keywords=asus;rog;keyboard;aura;fan;battery;
+StartupWMClass=ROG Control

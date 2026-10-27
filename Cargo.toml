@@ -1,0 +1,24 @@
+[package]
+name = "rog-control"
+version = "0.1.0"
+edition = "2021"
+description = "GUI + daemon per il controllo hardware dei laptop ASUS ROG"
+license = "MIT"
+
+[dependencies]
+eframe = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "rog-control"
+path = "src/main.rs"
+
+[[bin]]
+name = "rog-control-daemon"
+path = "src/bin/rogd.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

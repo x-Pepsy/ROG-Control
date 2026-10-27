@@ -1,0 +1,17 @@
+[Unit]
+Description=ROG Control hardware daemon (ASUS ROG)
+Documentation=file:///usr/local/share/doc/rog-control/README.md
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rog-control-daemon
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=rog-control
+RuntimeDirectoryMode=0755
+StateDirectory=rog-control
+StateDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
