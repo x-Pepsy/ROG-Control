@@ -37,9 +37,11 @@ pub enum Command {
     /// Modalità GPU: ultimate, standard, eco, optimized.
     SetGpuMode { mode: String },
     /// Limiti CPU in watt (5 = auto firmware).
-    SetPpt { spl: u8, sppt: u8 },
+    SetPpt { spl: u8, sppt: u8, fppt: u8 },
     /// Limiti GPU NVIDIA.
     SetNvLimits { temp_target: u8, dynamic_boost: u8 },
+    /// Offset clock NVIDIA in MHz (base/memory).
+    SetGpuOffsets { base_clock: i32, memory_clock: i32 },
     /// Salva il profilo manuale per la sorgente indicata ("ac" o "battery").
     SaveManualProfile {
         source: String,
@@ -49,6 +51,7 @@ pub enum Command {
         nv_dynamic_boost: u8,
         spl: u8,
         sppt: u8,
+        fppt: u8,
     },
     SetManualEnabled { enabled: bool },
     SetChargeLimit { value: u8 },
@@ -92,9 +95,32 @@ pub struct State {
     pub ppt: PptState,
     pub manual: ManualState,
     pub operating_mode: String,
+    pub limits: DeviceLimits,
     pub backlight: Option<BacklightState>,
     pub temps: Vec<TempReading>,
     pub nvidia: Option<NvidiaInfo>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ValueRange {
+    pub min: i32,
+    pub max: i32,
+}
+
+/// Limiti e capability specifici del modello. Non sono uguali per tutti i ROG.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceLimits {
+    pub profile: String,
+    /// "builtin", "config" oppure "generic".
+    pub source: String,
+    pub ppt_spl: ValueRange,
+    pub ppt_sppt: ValueRange,
+    pub ppt_fppt: ValueRange,
+    pub fppt_supported: bool,
+    pub gpu_temp: ValueRange,
+    pub gpu_boost: ValueRange,
+    pub gpu_base: ValueRange,
+    pub gpu_mem: ValueRange,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -203,12 +229,16 @@ pub struct GpuState {
     pub mux_available: bool,
     pub nv_temp_target: u8,
     pub nv_dynamic_boost: u8,
+    pub base_clock_offset: i32,
+    pub memory_clock_offset: i32,
+    pub offsets_supported: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PptState {
     pub spl: u8,
     pub sppt: u8,
+    pub fppt: u8,
     pub auto: bool,
 }
 
@@ -228,6 +258,12 @@ pub struct ManualProfile {
     pub nv_dynamic_boost: u8,
     pub spl: u8,
     pub sppt: u8,
+    #[serde(default = "ppt_auto_value")]
+    pub fppt: u8,
+}
+
+fn ppt_auto_value() -> u8 {
+    5
 }
 
 impl Default for ManualProfile {
@@ -237,8 +273,9 @@ impl Default for ManualProfile {
             gpu: default_curve(2),
             nv_temp_target: 75,
             nv_dynamic_boost: 5,
-            spl: 5,
-            sppt: 5,
+            spl: 28,
+            sppt: 28,
+            fppt: 28,
         }
     }
 }

@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::device;
+use crate::nvml;
 use crate::protocol::*;
 
 const KBD_LED: &str = "/sys/class/leds/asus::kbd_backlight";
@@ -32,6 +34,22 @@ pub struct DaemonConfig {
     /// Limite di ricarica persistente (0 = non impostato).
     #[serde(default)]
     pub charge_limit: u8,
+    #[serde(default = "default_nv_temp")]
+    pub nv_temp_target: u8,
+    #[serde(default = "default_nv_boost")]
+    pub nv_dynamic_boost: u8,
+    #[serde(default)]
+    pub gpu_base_offset: i32,
+    #[serde(default)]
+    pub gpu_memory_offset: i32,
+}
+
+fn default_nv_temp() -> u8 {
+    75
+}
+
+fn default_nv_boost() -> u8 {
+    5
 }
 
 impl Default for DaemonConfig {
@@ -43,6 +61,10 @@ impl Default for DaemonConfig {
             manual_ac: ManualProfile::default(),
             manual_battery: ManualProfile::default(),
             charge_limit: 0,
+            nv_temp_target: default_nv_temp(),
+            nv_dynamic_boost: default_nv_boost(),
+            gpu_base_offset: 0,
+            gpu_memory_offset: 0,
         }
     }
 }
@@ -463,7 +485,8 @@ fn battery_state() -> BatteryState {
 fn ppt_state() -> PptState {
     let spl = read_num::<u8>(format!("{WMI}/ppt_pl1_spl")).unwrap_or(5);
     let sppt = read_num::<u8>(format!("{WMI}/ppt_pl2_sppt")).unwrap_or(5);
-    PptState { spl, sppt, auto: spl == 5 && sppt == 5 }
+    let fppt = read_num::<u8>(format!("{WMI}/ppt_fppt")).unwrap_or(5);
+    PptState { spl, sppt, fppt, auto: spl == 5 && sppt == 5 && fppt == 5 }
 }
 
 fn gpu_state(cfg: &DaemonConfig) -> GpuState {
@@ -477,6 +500,11 @@ fn gpu_state(cfg: &DaemonConfig) -> GpuState {
         .unwrap_or(false);
     let dgpu_disabled = fw_attr("dgpu_disable").as_deref() == Some("1");
     let mux_mode = fw_attr("gpu_mux_mode").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let offsets = nvml::get_offsets();
+    let (base_clock_offset, memory_clock_offset, offsets_supported) = match offsets {
+        Some((base, mem)) => (base, mem, true),
+        None => (0, 0, false),
+    };
 
     let derived = if mux_mode == 1 {
         "ultimate"
@@ -505,6 +533,9 @@ fn gpu_state(cfg: &DaemonConfig) -> GpuState {
         mux_available: fw_attr_available("gpu_mux_mode"),
         nv_temp_target: read_num(format!("{WMI}/nv_temp_target")).unwrap_or(75),
         nv_dynamic_boost: read_num(format!("{WMI}/nv_dynamic_boost")).unwrap_or(5),
+        base_clock_offset,
+        memory_clock_offset,
+        offsets_supported,
     }
 }
 
@@ -630,6 +661,22 @@ fn cpu_boost() -> Option<bool> {
     read_num::<u8>(CPU_BOOST).map(|v| v == 1)
 }
 
+fn clamp_range(value: u8, range: ValueRange) -> u8 {
+    let min = range.min.clamp(0, 255) as u8;
+    let max = range.max.clamp(0, 255) as u8;
+    value.clamp(min, max)
+}
+
+/// 5 è il valore "auto/default" del firmware; gli altri vengono limitati al
+/// range specifico del modello.
+fn norm_ppt(value: u8, range: ValueRange) -> u8 {
+    if value == 5 {
+        5
+    } else {
+        clamp_range(value, range)
+    }
+}
+
 fn validate_curve(points: &[CurvePoint]) -> Result<(), String> {
     if points.len() != 8 {
         return Err("la curva deve avere esattamente 8 punti".to_string());
@@ -655,6 +702,7 @@ fn validate_curve(points: &[CurvePoint]) -> Result<(), String> {
 pub struct Hardware {
     pub aura: AuraState,
     pub config: DaemonConfig,
+    pub limits: DeviceLimits,
     hidraw: Option<PathBuf>,
     aura_saved: bool,
     cpu_prev: Option<(u64, u64)>,
@@ -678,6 +726,7 @@ impl Hardware {
         let hw = Self {
             aura: load_aura(),
             config,
+            limits: device::detect(),
             hidraw: find_hidraw(),
             aura_saved,
             cpu_prev: cpu_times(),
@@ -691,11 +740,20 @@ impl Hardware {
                 eprintln!("impossibile ripristinare il limite di ricarica: {e}");
             }
         }
+        if let Err(e) = hw.write_nv_limits(hw.config.nv_temp_target, hw.config.nv_dynamic_boost) {
+            eprintln!("impossibile ripristinare i limiti NVIDIA: {e}");
+        }
+        if hw.config.gpu_base_offset != 0 || hw.config.gpu_memory_offset != 0 {
+            if let Err(e) = nvml::set_offsets(hw.config.gpu_base_offset, hw.config.gpu_memory_offset) {
+                eprintln!("impossibile ripristinare gli offset GPU: {e}");
+            }
+        }
         hw
     }
 
     pub fn reload_config(&mut self) {
         self.config = load_config();
+        self.limits = device::detect();
     }
 
     pub fn has_saved_aura(&self) -> bool {
@@ -754,6 +812,7 @@ impl Hardware {
                 battery: self.config.manual_battery.clone(),
             },
             operating_mode,
+            limits: self.limits.clone(),
             backlight: backlight_state(),
             temps: temps(),
             nvidia: nvidia_info(),
@@ -823,10 +882,10 @@ impl Hardware {
                 errors.push(e);
             }
         }
-        if let Err(e) = self.set_ppt(5, 5) {
+        if let Err(e) = self.set_ppt(5, 5, 5) {
             errors.push(format!("PPT: {e}"));
         }
-        if let Err(e) = self.set_nv_limits(75, 5) {
+        if let Err(e) = self.write_nv_limits(75, 5) {
             errors.push(format!("NVIDIA: {e}"));
         }
         if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
@@ -900,18 +959,41 @@ impl Hardware {
         save_config(&self.config)
     }
 
-    pub fn set_ppt(&self, spl: u8, sppt: u8) -> HwResult<()> {
-        let spl = spl.clamp(5, 90);
-        let sppt = sppt.clamp(5, 90);
+    pub fn set_ppt(&self, spl: u8, sppt: u8, fppt: u8) -> HwResult<()> {
+        let spl = norm_ppt(spl, self.limits.ppt_spl);
+        let sppt = norm_ppt(sppt, self.limits.ppt_sppt);
+        let fppt = norm_ppt(fppt, self.limits.ppt_fppt);
         write_str(format!("{WMI}/ppt_pl1_spl"), &spl.to_string())?;
-        write_str(format!("{WMI}/ppt_pl2_sppt"), &sppt.to_string())
+        write_str(format!("{WMI}/ppt_pl2_sppt"), &sppt.to_string())?;
+        if self.limits.fppt_supported && Path::new(&format!("{WMI}/ppt_fppt")).exists() {
+            write_str(format!("{WMI}/ppt_fppt"), &fppt.to_string())?;
+        }
+        Ok(())
     }
 
-    pub fn set_nv_limits(&self, temp_target: u8, dynamic_boost: u8) -> HwResult<()> {
-        let temp = temp_target.clamp(60, 90);
-        let boost = dynamic_boost.clamp(0, 25);
+    fn write_nv_limits(&self, temp_target: u8, dynamic_boost: u8) -> HwResult<()> {
+        let temp = clamp_range(temp_target, self.limits.gpu_temp);
+        let boost = clamp_range(dynamic_boost, self.limits.gpu_boost);
         write_str(format!("{WMI}/nv_temp_target"), &temp.to_string())?;
         write_str(format!("{WMI}/nv_dynamic_boost"), &boost.to_string())
+    }
+
+    pub fn set_nv_limits(&mut self, temp_target: u8, dynamic_boost: u8) -> HwResult<()> {
+        let temp = clamp_range(temp_target, self.limits.gpu_temp);
+        let boost = clamp_range(dynamic_boost, self.limits.gpu_boost);
+        self.write_nv_limits(temp, boost)?;
+        self.config.nv_temp_target = temp;
+        self.config.nv_dynamic_boost = boost;
+        save_config(&self.config)
+    }
+
+    pub fn set_gpu_offsets(&mut self, base_clock: i32, memory_clock: i32) -> HwResult<()> {
+        let base = base_clock.clamp(self.limits.gpu_base.min, self.limits.gpu_base.max);
+        let mem = memory_clock.clamp(self.limits.gpu_mem.min, self.limits.gpu_mem.max);
+        nvml::set_offsets(base, mem)?;
+        self.config.gpu_base_offset = base;
+        self.config.gpu_memory_offset = mem;
+        save_config(&self.config)
     }
 
     pub fn save_manual_profile(
@@ -923,16 +1005,18 @@ impl Hardware {
         nv_dynamic_boost: u8,
         spl: u8,
         sppt: u8,
+        fppt: u8,
     ) -> HwResult<()> {
         validate_curve(&cpu)?;
         validate_curve(&gpu)?;
         let profile = ManualProfile {
             cpu,
             gpu,
-            nv_temp_target: nv_temp_target.clamp(60, 90),
-            nv_dynamic_boost: nv_dynamic_boost.clamp(0, 25),
-            spl: spl.clamp(5, 90),
-            sppt: sppt.clamp(5, 90),
+            nv_temp_target: clamp_range(nv_temp_target, self.limits.gpu_temp),
+            nv_dynamic_boost: clamp_range(nv_dynamic_boost, self.limits.gpu_boost),
+            spl: norm_ppt(spl, self.limits.ppt_spl),
+            sppt: norm_ppt(sppt, self.limits.ppt_sppt),
+            fppt: norm_ppt(fppt, self.limits.ppt_fppt),
         };
         match source {
             "ac" => self.config.manual_ac = profile.clone(),
@@ -978,10 +1062,10 @@ impl Hardware {
         if let Err(e) = self.set_fan_curve(2, &profile.gpu, true) {
             errors.push(format!("GPU fan: {e}"));
         }
-        if let Err(e) = self.set_ppt(profile.spl, profile.sppt) {
+        if let Err(e) = self.set_ppt(profile.spl, profile.sppt, profile.fppt) {
             errors.push(format!("PPT: {e}"));
         }
-        if let Err(e) = self.set_nv_limits(profile.nv_temp_target, profile.nv_dynamic_boost) {
+        if let Err(e) = self.write_nv_limits(profile.nv_temp_target, profile.nv_dynamic_boost) {
             errors.push(format!("NVIDIA: {e}"));
         }
         if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }

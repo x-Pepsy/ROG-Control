@@ -24,8 +24,8 @@ ACPI, hidraw), so it works on many ROG/Strix models.
   - Return to the BIOS automatic mode.
 - **Power**
   - ACPI profiles: quiet / balanced / performance.
-  - CPU PPT limits (SPL/SPPT) through ASUS WMI.
-  - NVIDIA thermal target and Dynamic Boost.
+  - CPU PPT limits (SPL/SPPT/FPPT) through ASUS WMI.
+  - NVIDIA thermal target, Dynamic Boost and clock offsets (NVML).
   - **Manual mode** with separate AC/battery profiles (fan curves, PPT, NVIDIA limits),
     applied automatically when the power source changes.
   - CPU Boost (amd-pstate).
@@ -83,6 +83,37 @@ rog-control
   and falls back to `0666` (single-user environment).
 - dGPU/mux changes always require confirmation in the GUI and a reboot.
 
+## Per-model profiles
+
+PPT and GPU limits are **device-specific**. ROG Control detects the model from DMI:
+
+- **ROG Strix G713RM** has a built-in profile with the official Armoury Crate ranges:
+  - SPL 28–90 W, SPPT 28–100 W, FPPT 28–125 W
+  - GPU thermal target 75–87 °C, Dynamic Boost 0–25 W
+  - Base clock offset 0–200 MHz, memory clock offset 0–300 MHz
+- Other ASUS ROG models use a **generic profile**. PPT ranges are read from
+  `asus-armoury` when the firmware exposes them; GPU limits use conservative
+  defaults and the UI shows a warning.
+- You can override the limits per model with `/etc/rog-control/device.json`
+  (see `packaging/device.json.example`). The active profile and its source
+  (`builtin`, `generic`, `config`) are shown in the UI.
+
+Example:
+
+```json
+{
+  "profile": "ROG Strix G713RM",
+  "ppt_spl": { "min": 28, "max": 90 },
+  "ppt_sppt": { "min": 28, "max": 100 },
+  "ppt_fppt": { "min": 28, "max": 125 },
+  "fppt_supported": true,
+  "gpu_temp": { "min": 75, "max": 87 },
+  "gpu_boost": { "min": 0, "max": 25 },
+  "gpu_base": { "min": 0, "max": 200 },
+  "gpu_mem": { "min": 0, "max": 300 }
+}
+```
+
 ## Technical notes
 
 - The Aura effect cannot be read back from the controller (the 0x5e handshake
@@ -91,13 +122,17 @@ rog-control
   at startup (with a few retries, since the controller is a USB device).
 - Aura packets are the same ones used by `asusctl`: `5d b3` (effect), `5d b5`
   (set), `5d b4` (apply), sent as 64-byte reports.
-- The `asus-armoury` PPT attributes return `ENODEV` on this board, but SPL/SPPT
-  are writable through the legacy `asus-nb-wmi` attributes (`ppt_pl1_spl`,
-  `ppt_pl2_sppt`). FPPT and APU SPPT are not exposed.
+- The `asus-armoury` PPT attributes return `ENODEV` on this board, but SPL, SPPT
+  and FPPT are writable through the legacy `asus-nb-wmi` attributes
+  (`ppt_pl1_spl`, `ppt_pl2_sppt`, `ppt_fppt`). APU SPPT is exposed read-only and
+  rejects writes with `ENODEV`.
 - Fan curves use `pwmN_enable=1` (custom) / `2` (BIOS auto), with 8 increasing
   temperature/PWM points. Manual profiles are stored in
   `/var/lib/rog-control/config.json`.
 - The charge limit is stored in the same config and restored when the daemon starts.
+- NVIDIA clock offsets are applied through NVML (`libnvidia-ml`), so they do not
+  require Coolbits or an X11 session. They reset on driver reload and are
+  reapplied by the daemon from `/var/lib/rog-control/config.json`.
 - Touchpad, Windows key and screen power saver are desktop features: they use
   `xinput`, `xmodmap` and `xrandr`, so they currently require an X11 session.
 

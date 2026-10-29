@@ -1,0 +1,11 @@
+{
+  "profile": "ROG Strix G713RM",
+  "ppt_spl": { "min": 28, "max": 90 },
+  "ppt_sppt": { "min": 28, "max": 100 },
+  "ppt_fppt": { "min": 28, "max": 125 },
+  "fppt_supported": true,
+  "gpu_temp": { "min": 75, "max": 87 },
+  "gpu_boost": { "min": 0, "max": 25 },
+  "gpu_base": { "min": 0, "max": 200 },
+  "gpu_mem": { "min": 0, "max": 300 }
+}

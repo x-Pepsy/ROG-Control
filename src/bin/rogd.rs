@@ -58,9 +58,12 @@ fn handle_command(hw: &mut Hardware, command: Command) -> HwResult<()> {
         Command::SetProfile { profile } => hw.set_profile(&profile),
         Command::SetOperatingMode { mode } => hw.set_operating_mode(&mode),
         Command::SetGpuMode { mode } => hw.set_gpu_mode(&mode),
-        Command::SetPpt { spl, sppt } => hw.set_ppt(spl, sppt),
+        Command::SetPpt { spl, sppt, fppt } => hw.set_ppt(spl, sppt, fppt),
         Command::SetNvLimits { temp_target, dynamic_boost } => {
             hw.set_nv_limits(temp_target, dynamic_boost)
+        }
+        Command::SetGpuOffsets { base_clock, memory_clock } => {
+            hw.set_gpu_offsets(base_clock, memory_clock)
         }
         Command::SaveManualProfile {
             source,
@@ -70,6 +73,7 @@ fn handle_command(hw: &mut Hardware, command: Command) -> HwResult<()> {
             nv_dynamic_boost,
             spl,
             sppt,
+            fppt,
         } => hw.save_manual_profile(
             &source,
             cpu,
@@ -78,6 +82,7 @@ fn handle_command(hw: &mut Hardware, command: Command) -> HwResult<()> {
             nv_dynamic_boost,
             spl,
             sppt,
+            fppt,
         ),
         Command::SetManualEnabled { enabled } => hw.set_manual_enabled(enabled),
         Command::SetChargeLimit { value } => hw.set_charge_limit(value),

@@ -345,8 +345,11 @@ struct App {
     display_brightness: u32,
     ppt_spl: u8,
     ppt_sppt: u8,
+    ppt_fppt: u8,
     nv_temp: u8,
     nv_boost: u8,
+    gpu_base: i32,
+    gpu_mem: i32,
     touchpad_enabled: bool,
     screen_saver: bool,
     win_key_enabled: bool,
@@ -381,8 +384,11 @@ impl App {
             display_brightness: 100,
             ppt_spl: 5,
             ppt_sppt: 5,
+            ppt_fppt: 5,
             nv_temp: 75,
             nv_boost: 5,
+            gpu_base: 0,
+            gpu_mem: 0,
             touchpad_enabled: session.touchpad_enabled,
             screen_saver: session.screen_saver,
             win_key_enabled: session.win_key_enabled,
@@ -438,10 +444,13 @@ impl App {
             }
         }
         self.charge_limit = state.battery.charge_limit;
-        self.ppt_spl = state.ppt.spl;
-        self.ppt_sppt = state.ppt.sppt;
+        self.ppt_spl = state.ppt.spl.max(state.limits.ppt_spl.min as u8);
+        self.ppt_sppt = state.ppt.sppt.max(state.limits.ppt_sppt.min as u8);
+        self.ppt_fppt = state.ppt.fppt.max(state.limits.ppt_fppt.min as u8);
         self.nv_temp = state.gpu.nv_temp_target;
         self.nv_boost = state.gpu.nv_dynamic_boost;
+        self.gpu_base = state.gpu.base_clock_offset;
+        self.gpu_mem = state.gpu.memory_clock_offset;
         if let Some(bl) = &state.backlight {
             self.display_brightness = bl.brightness;
         }
@@ -1243,6 +1252,24 @@ impl App {
 
     fn power_page(&mut self, ui: &mut egui::Ui, state: &State) {
         page_header(ui, "Alimentazione", "Profili, limiti CPU/GPU e modalità manuale");
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Profilo limiti: {} ({})",
+                    state.limits.profile, state.limits.source
+                ))
+                .size(11.0)
+                .weak(),
+            );
+            if state.limits.source == "generic" {
+                ui.label(
+                    RichText::new("limiti generici: verifica il tuo modello")
+                        .size(11.0)
+                        .color(YELLOW),
+                );
+            }
+        });
         ui.add_space(12.0);
 
         card(ui, |ui| {
@@ -1288,17 +1315,33 @@ impl App {
                 }
             });
             ui.label(
-                RichText::new("SPL = limite sostenuto, SPPT = limite di breve durata. 5 W significa auto/default.")
+                RichText::new("SPL = sostenuto, SPPT = breve durata, FPPT = picco. 5 = auto/default.")
                     .weak()
                     .size(12.0),
             );
             ui.add_space(8.0);
+            let spl = state.limits.ppt_spl;
+            let sppt = state.limits.ppt_sppt;
+            let fppt = state.limits.ppt_fppt;
             ui.horizontal(|ui| {
                 ui.label("SPL");
-                ui.add(egui::Slider::new(&mut self.ppt_spl, 5..=90).suffix(" W"));
-                ui.add_space(16.0);
+                ui.add(
+                    egui::Slider::new(&mut self.ppt_spl, (spl.min as u8)..=(spl.max as u8))
+                        .suffix(" W"),
+                );
+                ui.add_space(12.0);
                 ui.label("SPPT");
-                ui.add(egui::Slider::new(&mut self.ppt_sppt, 5..=90).suffix(" W"));
+                ui.add(
+                    egui::Slider::new(&mut self.ppt_sppt, (sppt.min as u8)..=(sppt.max as u8))
+                        .suffix(" W"),
+                );
+                ui.add_space(12.0);
+                ui.label("FPPT");
+                ui.add_enabled(
+                    state.limits.fppt_supported,
+                    egui::Slider::new(&mut self.ppt_fppt, (fppt.min as u8)..=(fppt.max as u8))
+                        .suffix(" W"),
+                );
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -1306,19 +1349,42 @@ impl App {
                     .add(egui::Button::new(RichText::new("Applica limiti").strong()).fill(ACCENT))
                     .clicked()
                 {
-                    self.send(Command::SetPpt { spl: self.ppt_spl, sppt: self.ppt_sppt });
+                    self.send(Command::SetPpt {
+                        spl: self.ppt_spl,
+                        sppt: self.ppt_sppt,
+                        fppt: self.ppt_fppt,
+                    });
                     self.notify("Limiti CPU applicati");
                 }
                 if ui.button("Ripristina auto").clicked() {
-                    self.ppt_spl = 5;
-                    self.ppt_sppt = 5;
-                    self.send(Command::SetPpt { spl: 5, sppt: 5 });
+                    self.ppt_spl = spl.min as u8;
+                    self.ppt_sppt = sppt.min as u8;
+                    self.ppt_fppt = fppt.min as u8;
+                    self.send(Command::SetPpt { spl: 5, sppt: 5, fppt: 5 });
                     self.notify("Limiti CPU in auto");
                 }
             });
             ui.add_space(4.0);
             ui.label(
-                RichText::new("FPPT e APU SPPT non sono esposti dal kernel su questo modello.")
+                RichText::new(format!(
+                    "Range modello: SPL {}–{} W · SPPT {}–{} W · FPPT {}–{} W{}",
+                    spl.min,
+                    spl.max,
+                    sppt.min,
+                    sppt.max,
+                    fppt.min,
+                    fppt.max,
+                    if state.limits.fppt_supported {
+                        ""
+                    } else {
+                        " (FPPT non supportato)"
+                    }
+                ))
+                .size(11.0)
+                .weak(),
+            );
+            ui.label(
+                RichText::new("APU SPPT non è scrivibile su questo modello (ENODEV).")
                     .size(11.0)
                     .weak(),
             );
@@ -1328,17 +1394,41 @@ impl App {
         card(ui, |ui| {
             ui.label(RichText::new("Limiti GPU NVIDIA").size(16.0).strong());
             ui.label(
-                RichText::new("Thermal target e Dynamic Boost (WMI asus-nb-wmi).")
+                RichText::new("Thermal target, Dynamic Boost e offset clock (WMI + NVML).")
                     .weak()
                     .size(12.0),
             );
             ui.add_space(8.0);
+            let temp = state.limits.gpu_temp;
+            let boost = state.limits.gpu_boost;
+            let base = state.limits.gpu_base;
+            let mem = state.limits.gpu_mem;
             ui.horizontal(|ui| {
                 ui.label("Thermal target");
-                ui.add(egui::Slider::new(&mut self.nv_temp, 60..=90).suffix(" °C"));
-                ui.add_space(16.0);
+                ui.add(
+                    egui::Slider::new(&mut self.nv_temp, (temp.min as u8)..=(temp.max as u8))
+                        .suffix(" °C"),
+                );
+                ui.add_space(14.0);
                 ui.label("Dynamic Boost");
-                ui.add(egui::Slider::new(&mut self.nv_boost, 0..=25).suffix(" W"));
+                ui.add(
+                    egui::Slider::new(&mut self.nv_boost, (boost.min as u8)..=(boost.max as u8))
+                        .suffix(" W"),
+                );
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Base clock");
+                ui.add_enabled(
+                    state.gpu.offsets_supported,
+                    egui::Slider::new(&mut self.gpu_base, base.min..=base.max).suffix(" MHz"),
+                );
+                ui.add_space(14.0);
+                ui.label("Memory clock");
+                ui.add_enabled(
+                    state.gpu.offsets_supported,
+                    egui::Slider::new(&mut self.gpu_mem, mem.min..=mem.max).suffix(" MHz"),
+                );
             });
             ui.add_space(8.0);
             if ui
@@ -1349,16 +1439,32 @@ impl App {
                     temp_target: self.nv_temp,
                     dynamic_boost: self.nv_boost,
                 });
+                if state.gpu.offsets_supported {
+                    self.send(Command::SetGpuOffsets {
+                        base_clock: self.gpu_base,
+                        memory_clock: self.gpu_mem,
+                    });
+                }
                 self.notify("Limiti GPU applicati");
             }
             ui.label(
                 RichText::new(format!(
-                    "Valori attuali: {} °C, {} W.",
-                    state.gpu.nv_temp_target, state.gpu.nv_dynamic_boost
+                    "Attuali: {} °C · {} W · offset {}/{} MHz",
+                    state.gpu.nv_temp_target,
+                    state.gpu.nv_dynamic_boost,
+                    state.gpu.base_clock_offset,
+                    state.gpu.memory_clock_offset
                 ))
                 .size(11.0)
                 .weak(),
             );
+            if !state.gpu.offsets_supported {
+                ui.label(
+                    RichText::new("Offset clock non disponibili (NVML/GPU assente).")
+                        .size(11.0)
+                        .color(YELLOW),
+                );
+            }
         });
 
         ui.add_space(14.0);
@@ -1441,6 +1547,7 @@ impl App {
             nv_dynamic_boost: self.nv_boost,
             spl: self.ppt_spl,
             sppt: self.ppt_sppt,
+            fppt: self.ppt_fppt,
         });
         self.notify(if source == "ac" {
             "Profilo manuale AC salvato"
@@ -1741,6 +1848,11 @@ impl App {
                     row(ui, "Uptime", &format_uptime(state.system.uptime_secs));
                     row(ui, "Load (1m)", &format!("{:.2}", state.system.load1));
                     row(ui, "Governor CPU", &state.system.cpu_governor);
+                    row(
+                        ui,
+                        "Profilo limiti",
+                        &format!("{} ({})", state.limits.profile, state.limits.source),
+                    );
                     row(ui, "Versione demone", &state.system.daemon_version);
                     row(ui, "Socket", &state.system.socket);
                 });
@@ -2077,8 +2189,8 @@ const GPU_MODES: &[(&str, &str, &str)] = &[
 
 fn manual_summary(p: &ManualProfile) -> String {
     format!(
-        "SPL {} W · SPPT {} W · GPU {} °C / {} W · ventole 8 punti",
-        p.spl, p.sppt, p.nv_temp_target, p.nv_dynamic_boost
+        "SPL {} W · SPPT {} W · FPPT {} W · GPU {} °C / {} W · ventole 8 punti",
+        p.spl, p.sppt, p.fppt, p.nv_temp_target, p.nv_dynamic_boost
     )
 }
 

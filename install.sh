@@ -29,6 +29,7 @@ $SUDO gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || tr
 
 echo "==> Documentazione"
 $SUDO install -Dm644 README.md /usr/local/share/doc/rog-control/README.md
+$SUDO install -Dm644 packaging/device.json.example /usr/local/share/doc/rog-control/device.json.example
 
 echo "==> Attivazione demone"
 $SUDO systemctl daemon-reload
