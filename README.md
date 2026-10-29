@@ -114,6 +114,23 @@ Example:
 }
 ```
 
+## Persistence
+
+Every value changed in ROG Control is written to
+`/var/lib/rog-control/config.json` and applied again when the daemon starts:
+
+- operating mode, platform profile, manual mode and AC/battery profiles;
+- CPU PPT (SPL/SPPT/FPPT) and custom fan curves;
+- NVIDIA thermal target, Dynamic Boost and base/memory clock offsets;
+- charge limit, keyboard brightness, display brightness, CPU Boost,
+  Panel Overdrive and boot sound;
+- GPU mode and Aura effect (Aura has its own state file).
+
+At boot the daemon retries the restore after 5, 15 and 40 seconds, because the
+NVIDIA driver and the ASUS WMI/hidraw devices may not be ready immediately.
+The values already present on first run are adopted, so nothing is lost when
+upgrading from an older version.
+
 ## Technical notes
 
 - The Aura effect cannot be read back from the controller (the 0x5e handshake
@@ -133,6 +150,9 @@ Example:
 - NVIDIA clock offsets are applied through NVML (`libnvidia-ml`), so they do not
   require Coolbits or an X11 session. They reset on driver reload and are
   reapplied by the daemon from `/var/lib/rog-control/config.json`.
+- GPU MUX values follow the kernel ABI: `gpu_mux_mode=0` is **Ultimate**
+  (dGPU only), `1` is **Hybrid/Optimus**. Eco sets `dgpu_disable=1` and
+  Hybrid mode. Changes require a reboot.
 - Touchpad, Windows key and screen power saver are desktop features: they use
   `xinput`, `xmodmap` and `xrandr`, so they currently require an X11 session.
 

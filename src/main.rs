@@ -1671,7 +1671,7 @@ impl App {
             ui.label(
                 RichText::new(format!(
                     "Mux attuale: {} · dGPU {}",
-                    if state.gpu.mux_mode == 1 { "Ultimate" } else { "Hybrid" },
+                    if state.gpu.mux_mode == 0 { "Ultimate" } else { "Hybrid" },
                     if state.gpu.dgpu_disabled { "disattivata" } else { "attiva" }
                 ))
                 .size(11.0)

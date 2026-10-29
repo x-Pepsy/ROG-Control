@@ -167,6 +167,23 @@ fn spawn_power_monitor() {
     });
 }
 
+/// Al boot driver e dispositivi possono non essere pronti: riprova a
+/// riapplicare le impostazioni salvate per qualche decina di secondi.
+fn spawn_boot_retry() {
+    std::thread::spawn(|| {
+        for delay in [5u64, 15, 40] {
+            std::thread::sleep(Duration::from_secs(delay));
+            let hw = Hardware::new_without_restore();
+            if hw.config.manual_enabled {
+                if let Err(e) = hw.apply_manual_for_current_source() {
+                    eprintln!("retry profilo manuale non applicato: {e}");
+                }
+            }
+            hw.retry_gpu_settings();
+        }
+    });
+}
+
 fn main() {
     let path = Path::new(SOCKET_PATH);
     let listener = match prepare_socket(path) {
@@ -180,6 +197,7 @@ fn main() {
     eprintln!("rog-control-daemon {} in ascolto su {}", DAEMON_VERSION, SOCKET_PATH);
     let mut hw = Hardware::new();
     spawn_power_monitor();
+    spawn_boot_retry();
 
     // Il controller RGB è un dispositivo USB: al boot può comparire dopo il demone.
     if hw.has_saved_aura() {

@@ -42,6 +42,33 @@ pub struct DaemonConfig {
     pub gpu_base_offset: i32,
     #[serde(default)]
     pub gpu_memory_offset: i32,
+    /// Valori PPT personalizzati (None = mai impostati).
+    #[serde(default)]
+    pub ppt_spl: Option<u8>,
+    #[serde(default)]
+    pub ppt_sppt: Option<u8>,
+    #[serde(default)]
+    pub ppt_fppt: Option<u8>,
+    /// Curve ventole della pagina Ventole.
+    #[serde(default)]
+    pub fan_cpu: Option<Vec<CurvePoint>>,
+    #[serde(default)]
+    pub fan_gpu: Option<Vec<CurvePoint>>,
+    #[serde(default)]
+    pub fan_cpu_enabled: Option<bool>,
+    #[serde(default)]
+    pub fan_gpu_enabled: Option<bool>,
+    /// Altre impostazioni salvate dalla UI.
+    #[serde(default)]
+    pub kbd_brightness: Option<u8>,
+    #[serde(default)]
+    pub display_brightness: Option<u32>,
+    #[serde(default)]
+    pub cpu_boost: Option<bool>,
+    #[serde(default)]
+    pub panel_overdrive: Option<bool>,
+    #[serde(default)]
+    pub boot_sound: Option<bool>,
 }
 
 fn default_nv_temp() -> u8 {
@@ -65,6 +92,18 @@ impl Default for DaemonConfig {
             nv_dynamic_boost: default_nv_boost(),
             gpu_base_offset: 0,
             gpu_memory_offset: 0,
+            ppt_spl: None,
+            ppt_sppt: None,
+            ppt_fppt: None,
+            fan_cpu: None,
+            fan_gpu: None,
+            fan_cpu_enabled: None,
+            fan_gpu_enabled: None,
+            kbd_brightness: None,
+            display_brightness: None,
+            cpu_boost: None,
+            panel_overdrive: None,
+            boot_sound: None,
         }
     }
 }
@@ -239,6 +278,19 @@ fn mode_from_profile(profile: &str) -> String {
     .to_string()
 }
 
+/// Profilo ACPI da scrivere per la modalità operativa salvata.
+fn profile_for_mode(mode: &str) -> Option<&'static str> {
+    if mode.is_empty() {
+        return None;
+    }
+    Some(match mode {
+        "silent" => "quiet",
+        "turbo" => "performance",
+        "manual" => "performance",
+        _ => "balanced",
+    })
+}
+
 fn effective_mode(cfg: &DaemonConfig, profile: &ProfileState) -> String {
     if cfg.manual_enabled {
         return "manual".to_string();
@@ -256,8 +308,44 @@ fn effective_mode(cfg: &DaemonConfig, profile: &ProfileState) -> String {
     }
 }
 
-fn load_config() -> DaemonConfig {
-    let mut cfg: DaemonConfig = fs::read_to_string(CONFIG_PATH)
+/// Alla prima esecuzione adotta i valori già presenti nell'hardware, così
+/// anche le impostazioni esistenti diventano persistenti e vengono riapplicate.
+fn adopt_current_settings(cfg: &mut DaemonConfig) -> bool {
+    let mut changed = false;
+    if cfg.kbd_brightness.is_none() {
+        if let Some(v) = read_num::<u8>(format!("{KBD_LED}/brightness")) {
+            cfg.kbd_brightness = Some(v);
+            changed = true;
+        }
+    }
+    if cfg.display_brightness.is_none() {
+        if let Some(bl) = backlight_state() {
+            cfg.display_brightness = Some(bl.brightness);
+            changed = true;
+        }
+    }
+    if cfg.cpu_boost.is_none() {
+        if let Some(v) = cpu_boost() {
+            cfg.cpu_boost = Some(v);
+            changed = true;
+        }
+    }
+    if cfg.panel_overdrive.is_none() {
+        if let Some(v) = fw_attr("panel_overdrive").or_else(|| read_opt(format!("{WMI}/panel_od"))) {
+            cfg.panel_overdrive = Some(v == "1");
+            changed = true;
+        }
+    }
+    if cfg.boot_sound.is_none() {
+        if let Some(v) = fw_attr("boot_sound").or_else(|| read_opt(format!("{WMI}/boot_sound"))) {
+            cfg.boot_sound = Some(v == "1");
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn load_config() -> DaemonConfig {    let mut cfg: DaemonConfig = fs::read_to_string(CONFIG_PATH)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
@@ -506,10 +594,12 @@ fn gpu_state(cfg: &DaemonConfig) -> GpuState {
         None => (0, 0, false),
     };
 
-    let derived = if mux_mode == 1 {
-        "ultimate"
-    } else if dgpu_disabled {
+    let derived = if dgpu_disabled {
+        // Eco: dGPU disattivata; il pannello è gestito dalla iGPU (Optimus).
         "eco"
+    } else if mux_mode == 0 {
+        // 0 = solo dGPU (Discrete/Ultimate), 1 = Optimus/Hybrid.
+        "ultimate"
     } else {
         "standard"
     };
@@ -711,6 +801,16 @@ pub struct Hardware {
 
 impl Hardware {
     pub fn new() -> Self {
+        Self::build(true)
+    }
+
+    /// Costruisce l'oggetto senza riapplicare le impostazioni.
+    /// Usato dai retry di avvio, che riapplicano solo ciò che dipende dal driver.
+    pub fn new_without_restore() -> Self {
+        Self::build(false)
+    }
+
+    fn build(restore: bool) -> Self {
         let aura_saved = Path::new(AURA_STATE_PATH).exists();
         let mut config = load_config();
         // Adotta il limite di ricarica già presente nell'EC alla prima esecuzione,
@@ -723,7 +823,7 @@ impl Hardware {
                 }
             }
         }
-        let hw = Self {
+        let mut hw = Self {
             aura: load_aura(),
             config,
             limits: device::detect(),
@@ -732,23 +832,123 @@ impl Hardware {
             cpu_prev: cpu_times(),
             last_state_at: Instant::now(),
         };
-        if (20..=100).contains(&hw.config.charge_limit) {
-            if let Err(e) = write_str(
-                format!("{BAT}/charge_control_end_threshold"),
-                &hw.config.charge_limit.to_string(),
-            ) {
-                eprintln!("impossibile ripristinare il limite di ricarica: {e}");
-            }
+        if adopt_current_settings(&mut hw.config) {
+            let _ = save_config(&hw.config);
         }
-        if let Err(e) = hw.write_nv_limits(hw.config.nv_temp_target, hw.config.nv_dynamic_boost) {
-            eprintln!("impossibile ripristinare i limiti NVIDIA: {e}");
-        }
-        if hw.config.gpu_base_offset != 0 || hw.config.gpu_memory_offset != 0 {
-            if let Err(e) = nvml::set_offsets(hw.config.gpu_base_offset, hw.config.gpu_memory_offset) {
-                eprintln!("impossibile ripristinare gli offset GPU: {e}");
-            }
+        if restore {
+            hw.restore_persisted();
         }
         hw
+    }
+
+    /// Riapplica tutte le impostazioni salvate su disco.
+    ///
+    /// Viene chiamato all'avvio del demone e può essere richiamato più volte:
+    /// al boot driver e dispositivi (NVIDIA, hidraw, WMI) possono non essere
+    /// ancora pronti.
+    pub fn restore_persisted(&mut self) {
+        let errors = self.reapply_all();
+        for e in errors {
+            eprintln!("ripristino impostazioni: {e}");
+        }
+    }
+
+    /// Riapplica solo le impostazioni che dipendono dal driver NVIDIA.
+    /// Usato dai retry di avvio senza toccare luminosità o altri valori che
+    /// l'utente potrebbe aver appena modificato.
+    pub fn retry_gpu_settings(&self) {
+        let mut errors = Vec::new();
+        if let Err(e) = self.write_nv_limits(self.config.nv_temp_target, self.config.nv_dynamic_boost) {
+            errors.push(format!("limiti NVIDIA: {e}"));
+        }
+        if self.config.gpu_base_offset != 0 || self.config.gpu_memory_offset != 0 {
+            if let Err(e) = nvml::set_offsets(self.config.gpu_base_offset, self.config.gpu_memory_offset) {
+                errors.push(format!("offset GPU: {e}"));
+            }
+        }
+        for e in errors {
+            eprintln!("retry impostazioni GPU: {e}");
+        }
+    }
+
+    fn reapply_all(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        if let Some(profile) = profile_for_mode(&self.config.operating_mode) {
+            if let Err(e) = self.write_profile(profile) {
+                errors.push(format!("profilo: {e}"));
+            }
+        }
+
+        if (20..=100).contains(&self.config.charge_limit) {
+            if let Err(e) = write_str(
+                format!("{BAT}/charge_control_end_threshold"),
+                &self.config.charge_limit.to_string(),
+            ) {
+                errors.push(format!("limite di ricarica: {e}"));
+            }
+        }
+
+        if let Some(spl) = self.config.ppt_spl {
+            if let Err(e) = self.write_ppt(
+                spl,
+                self.config.ppt_sppt.unwrap_or(spl),
+                self.config.ppt_fppt.unwrap_or(spl),
+            ) {
+                errors.push(format!("PPT: {e}"));
+            }
+        }
+
+        let fans = [
+            (1u8, self.config.fan_cpu.as_deref(), self.config.fan_cpu_enabled),
+            (2, self.config.fan_gpu.as_deref(), self.config.fan_gpu_enabled),
+        ];
+        for (fan, points, enabled) in fans {
+            if enabled != Some(true) {
+                continue;
+            }
+            let Some(points) = points else { continue };
+            if let Err(e) = self.write_fan_curve(fan, points, true) {
+                errors.push(format!("curva ventola {fan}: {e}"));
+            }
+        }
+
+        if let Err(e) = self.write_nv_limits(self.config.nv_temp_target, self.config.nv_dynamic_boost) {
+            errors.push(format!("limiti NVIDIA: {e}"));
+        }
+        if self.config.gpu_base_offset != 0 || self.config.gpu_memory_offset != 0 {
+            if let Err(e) = nvml::set_offsets(self.config.gpu_base_offset, self.config.gpu_memory_offset) {
+                errors.push(format!("offset GPU: {e}"));
+            }
+        }
+
+        if let Some(v) = self.config.kbd_brightness {
+            if let Err(e) = self.write_kbd_brightness(v) {
+                errors.push(format!("luminosità tastiera: {e}"));
+            }
+        }
+        if let Some(v) = self.config.display_brightness {
+            if let Err(e) = self.write_display_brightness(v) {
+                errors.push(format!("luminosità schermo: {e}"));
+            }
+        }
+        if let Some(v) = self.config.cpu_boost {
+            if let Err(e) = write_str(CPU_BOOST, if v { "1" } else { "0" }) {
+                errors.push(format!("CPU boost: {e}"));
+            }
+        }
+        if let Some(v) = self.config.panel_overdrive {
+            if let Err(e) = self.write_panel_overdrive(v) {
+                errors.push(format!("panel overdrive: {e}"));
+            }
+        }
+        if let Some(v) = self.config.boot_sound {
+            if let Err(e) = self.write_boot_sound(v) {
+                errors.push(format!("boot sound: {e}"));
+            }
+        }
+
+        errors
     }
 
     pub fn reload_config(&mut self) {
@@ -819,9 +1019,17 @@ impl Hardware {
         }
     }
 
-    pub fn set_kbd_brightness(&self, value: u8) -> HwResult<()> {
+    fn write_kbd_brightness(&self, value: u8) -> HwResult<()> {
         let max: u8 = read_num(format!("{KBD_LED}/max_brightness")).unwrap_or(3);
         write_str(format!("{KBD_LED}/brightness"), &value.min(max).to_string())
+    }
+
+    pub fn set_kbd_brightness(&mut self, value: u8) -> HwResult<()> {
+        let max: u8 = read_num(format!("{KBD_LED}/max_brightness")).unwrap_or(3);
+        let value = value.min(max);
+        self.write_kbd_brightness(value)?;
+        self.config.kbd_brightness = Some(value);
+        save_config(&self.config)
     }
 
     pub fn set_aura(&mut self, mode: u8, colour1: [u8; 3], colour2: [u8; 3], speed: u8, direction: u8) -> HwResult<()> {
@@ -841,13 +1049,21 @@ impl Hardware {
         Ok(())
     }
 
-    pub fn set_display_brightness(&self, value: u32) -> HwResult<()> {
+    fn write_display_brightness(&self, value: u32) -> HwResult<()> {
         let bl = backlight_state().ok_or_else(|| "backlight non trovato".to_string())?;
         let p = backlight_path().ok_or_else(|| "backlight non trovato".to_string())?;
         write_str(p.join("brightness"), &value.min(bl.max_brightness).to_string())
     }
 
-    pub fn set_fan_curve(&self, fan: u8, points: &[CurvePoint], enabled: bool) -> HwResult<()> {
+    pub fn set_display_brightness(&mut self, value: u32) -> HwResult<()> {
+        let bl = backlight_state().ok_or_else(|| "backlight non trovato".to_string())?;
+        let value = value.min(bl.max_brightness);
+        self.write_display_brightness(value)?;
+        self.config.display_brightness = Some(value);
+        save_config(&self.config)
+    }
+
+    fn write_fan_curve(&self, fan: u8, points: &[CurvePoint], enabled: bool) -> HwResult<()> {
         if !(1..=2).contains(&fan) {
             return Err(format!("ventola non valida: {fan}"));
         }
@@ -871,23 +1087,46 @@ impl Hardware {
         write_str(curve.join(format!("pwm{fan}_enable")), "1")
     }
 
+    pub fn set_fan_curve(&mut self, fan: u8, points: &[CurvePoint], enabled: bool) -> HwResult<()> {
+        self.write_fan_curve(fan, points, enabled)?;
+        match fan {
+            1 => {
+                self.config.fan_cpu = Some(points.to_vec());
+                self.config.fan_cpu_enabled = Some(enabled);
+            }
+            2 => {
+                self.config.fan_gpu = Some(points.to_vec());
+                self.config.fan_gpu_enabled = Some(enabled);
+            }
+            _ => unreachable!(),
+        }
+        save_config(&self.config)
+    }
+
     fn write_profile(&self, profile: &str) -> HwResult<()> {
         write_str("/sys/firmware/acpi/platform_profile", profile)
     }
 
-    fn disable_manual_fans(&self) -> HwResult<()> {
+    fn disable_manual_fans(&mut self) -> HwResult<()> {
         let mut errors = Vec::new();
         for fan in 1..=2 {
-            if let Err(e) = self.set_fan_curve(fan, &[], false) {
+            if let Err(e) = self.write_fan_curve(fan, &[], false) {
                 errors.push(e);
             }
         }
-        if let Err(e) = self.set_ppt(5, 5, 5) {
+        if let Err(e) = self.write_ppt(5, 5, 5) {
             errors.push(format!("PPT: {e}"));
         }
         if let Err(e) = self.write_nv_limits(75, 5) {
             errors.push(format!("NVIDIA: {e}"));
         }
+        // Anche lo stato salvato torna ai valori automatici del firmware.
+        self.config.ppt_spl = Some(5);
+        self.config.ppt_sppt = Some(5);
+        self.config.ppt_fppt = Some(5);
+        self.config.fan_cpu_enabled = Some(false);
+        self.config.fan_gpu_enabled = Some(false);
+        let _ = save_config(&self.config);
         if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
     }
 
@@ -909,11 +1148,7 @@ impl Hardware {
     pub fn set_operating_mode(&mut self, mode: &str) -> HwResult<()> {
         match mode {
             "windows" | "performance" | "silent" | "turbo" => {
-                let profile = match mode {
-                    "silent" => "quiet",
-                    "turbo" => "performance",
-                    _ => "balanced",
-                };
+                let profile = profile_for_mode(mode).unwrap();
                 if self.config.manual_enabled {
                     self.config.manual_enabled = false;
                     self.disable_manual_fans()?;
@@ -935,10 +1170,11 @@ impl Hardware {
 
     pub fn set_gpu_mode(&mut self, mode: &str) -> HwResult<()> {
         let (mux, dgpu) = match mode {
-            "ultimate" => (Some("1"), Some("0")),
-            "standard" => (Some("0"), Some("0")),
-            "eco" => (None, Some("1")),
-            "optimized" => (Some("0"), Some("0")),
+            // gpu_mux_mode: 0 = solo dGPU (Ultimate), 1 = Optimus/Hybrid.
+            "ultimate" => (Some("0"), Some("0")),
+            "standard" => (Some("1"), Some("0")),
+            "eco" => (Some("1"), Some("1")),
+            "optimized" => (Some("1"), Some("0")),
             other => return Err(format!("modalità GPU non valida: {other}")),
         };
         let mut errors = Vec::new();
@@ -959,7 +1195,18 @@ impl Hardware {
         save_config(&self.config)
     }
 
-    pub fn set_ppt(&self, spl: u8, sppt: u8, fppt: u8) -> HwResult<()> {
+    pub fn set_ppt(&mut self, spl: u8, sppt: u8, fppt: u8) -> HwResult<()> {
+        let spl = norm_ppt(spl, self.limits.ppt_spl);
+        let sppt = norm_ppt(sppt, self.limits.ppt_sppt);
+        let fppt = norm_ppt(fppt, self.limits.ppt_fppt);
+        self.write_ppt(spl, sppt, fppt)?;
+        self.config.ppt_spl = Some(spl);
+        self.config.ppt_sppt = Some(sppt);
+        self.config.ppt_fppt = Some(fppt);
+        save_config(&self.config)
+    }
+
+    fn write_ppt(&self, spl: u8, sppt: u8, fppt: u8) -> HwResult<()> {
         let spl = norm_ppt(spl, self.limits.ppt_spl);
         let sppt = norm_ppt(sppt, self.limits.ppt_sppt);
         let fppt = norm_ppt(fppt, self.limits.ppt_fppt);
@@ -1040,8 +1287,8 @@ impl Hardware {
         } else {
             self.config.manual_enabled = false;
             self.config.operating_mode = mode_from_profile(&profile_state().current);
-            save_config(&self.config)?;
-            self.disable_manual_fans()
+            let _ = self.disable_manual_fans();
+            save_config(&self.config)
         }
     }
 
@@ -1056,13 +1303,13 @@ impl Hardware {
 
     fn apply_manual_profile(&self, profile: &ManualProfile) -> HwResult<()> {
         let mut errors = Vec::new();
-        if let Err(e) = self.set_fan_curve(1, &profile.cpu, true) {
+        if let Err(e) = self.write_fan_curve(1, &profile.cpu, true) {
             errors.push(format!("CPU fan: {e}"));
         }
-        if let Err(e) = self.set_fan_curve(2, &profile.gpu, true) {
+        if let Err(e) = self.write_fan_curve(2, &profile.gpu, true) {
             errors.push(format!("GPU fan: {e}"));
         }
-        if let Err(e) = self.set_ppt(profile.spl, profile.sppt, profile.fppt) {
+        if let Err(e) = self.write_ppt(profile.spl, profile.sppt, profile.fppt) {
             errors.push(format!("PPT: {e}"));
         }
         if let Err(e) = self.write_nv_limits(profile.nv_temp_target, profile.nv_dynamic_boost) {
@@ -1078,7 +1325,7 @@ impl Hardware {
         save_config(&self.config)
     }
 
-    pub fn set_panel_overdrive(&self, value: bool) -> HwResult<()> {
+    fn write_panel_overdrive(&self, value: bool) -> HwResult<()> {
         let v = if value { "1" } else { "0" };
         if Path::new(&format!("{FW_ATTRS}/panel_overdrive/current_value")).exists() {
             set_fw_attr("panel_overdrive", v)
@@ -1087,13 +1334,25 @@ impl Hardware {
         }
     }
 
-    pub fn set_boot_sound(&self, value: bool) -> HwResult<()> {
+    pub fn set_panel_overdrive(&mut self, value: bool) -> HwResult<()> {
+        self.write_panel_overdrive(value)?;
+        self.config.panel_overdrive = Some(value);
+        save_config(&self.config)
+    }
+
+    fn write_boot_sound(&self, value: bool) -> HwResult<()> {
         let v = if value { "1" } else { "0" };
         if Path::new(&format!("{FW_ATTRS}/boot_sound/current_value")).exists() {
             set_fw_attr("boot_sound", v)
         } else {
             write_str(format!("{WMI}/boot_sound"), v)
         }
+    }
+
+    pub fn set_boot_sound(&mut self, value: bool) -> HwResult<()> {
+        self.write_boot_sound(value)?;
+        self.config.boot_sound = Some(value);
+        save_config(&self.config)
     }
 
     pub fn set_dgpu_disabled(&self, value: bool) -> HwResult<()> {
@@ -1107,7 +1366,9 @@ impl Hardware {
         set_fw_attr("gpu_mux_mode", &value.to_string())
     }
 
-    pub fn set_cpu_boost(&self, value: bool) -> HwResult<()> {
-        write_str(CPU_BOOST, if value { "1" } else { "0" })
+    pub fn set_cpu_boost(&mut self, value: bool) -> HwResult<()> {
+        write_str(CPU_BOOST, if value { "1" } else { "0" })?;
+        self.config.cpu_boost = Some(value);
+        save_config(&self.config)
     }
 }
